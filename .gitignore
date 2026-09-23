@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local state written by the tools, not source
+.disk-snapshot.json
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.*
