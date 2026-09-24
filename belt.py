@@ -2,11 +2,25 @@
 """UtilityBelt - interactive dashboard for this machine and the Claude work on it.
 
     python belt.py            # full interactive dashboard
+    python belt.py --mini     # start as the small always-visible strip
     python belt.py --probe    # print one sample of every metric and exit
 
-Click any panel (or press its number) to open a detail view. Escape goes back.
+Three levels of detail:
+  mini       a three-line strip for a corner of the screen. Chosen automatically
+             when the window is small, or with --mini / the m key.
+  standard   eight cards, each with one headline number and a 5-minute graph.
+  detail     click a card or press its number (1-8); h opens the health view.
+             Escape goes back.
+
 Everything repaints once a second; nothing here starts, stops, or changes
 anything on the machine.
+
+Display rules
+-------------
+Problems first: the top bar names whatever needs attention, or says all good.
+Colour carries meaning only - grey is normal, yellow is worth a look, red needs
+action. Each card leads with one number; everything else lives in its detail
+view. Lines never wrap; they end in an ellipsis instead.
 
 Why the sampling is threaded
 ----------------------------
@@ -18,6 +32,10 @@ second would cost more than the frame. Instead one PowerShell process is
 started once and left running, printing a JSON line per second that a reader
 thread consumes. The UI only ever touches already-sampled values.
 
+Slower facts (Ollama's loaded models, the Windows event log, RAM and BIOS
+details) come from a third thread on their own clocks: Ollama every 5 s, the
+event log every 5 min, hardware inventory once at start.
+
 Metric selection follows what btop and glances consider the useful set: per-core
 CPU rather than just an average, memory split by cached/available, disk I/O
 rates alongside capacity, network throughput, and per-process attribution.
@@ -27,36 +45,114 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
-from collections import defaultdict, deque
-from datetime import datetime, timezone
+import urllib.request
+from collections import Counter, defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psutil
+from rich.markup import escape
+from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
-from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
+from textual.containers import Grid, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Sparkline, Static
+from textual.widgets import Static
+
+_JOB = None                     # Windows job that owns our child processes
+
+
+def _die_with_this_process(proc) -> None:
+    """Put `proc` in a job object that is closed when this process ends, however
+    it ends (window closed, killed, crash). Without it the GPU PowerShell loop
+    outlived every closed belt and piled up: seven orphans polling the GPU
+    counters found on 2026-09-23, costing a CPU core and stream stutter."""
+    global _JOB
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.OpenProcess.restype = wintypes.HANDLE
+        if _JOB is None:
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                return
+
+            class _Limits(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                            ("PerJobUserTimeLimit", ctypes.c_int64),
+                            ("LimitFlags", wintypes.DWORD),
+                            ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t),
+                            ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.c_size_t),
+                            ("PriorityClass", wintypes.DWORD),
+                            ("SchedulingClass", wintypes.DWORD)]
+
+            class _IoCounters(ctypes.Structure):
+                _fields_ = [(n, ctypes.c_uint64) for n in (
+                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+            class _ExtLimits(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", _Limits),
+                            ("IoInfo", _IoCounters),
+                            ("ProcessMemoryLimit", ctypes.c_size_t),
+                            ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                            ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            info = _ExtLimits()
+            info.BasicLimitInformation.LimitFlags = 0x2000   # KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                return                                         # 9 = ExtendedLimitInformation
+            _JOB = job                                         # keep open for our lifetime
+        handle = k32.OpenProcess(0x0001 | 0x0100, False, proc.pid)  # TERMINATE | SET_QUOTA
+        if handle:
+            k32.AssignProcessToJobObject(_JOB, handle)
+            k32.CloseHandle(handle)
+    except Exception:
+        pass                                                   # best effort; never break the belt
+
 
 HOME = Path.home()
 CLAUDE = HOME / ".claude"
 PROJECTS = CLAUDE / "projects"
 
-HIST = 120                      # samples kept per series (2 minutes at 1 Hz)
+HIST = 300                      # samples kept per series (5 minutes at 1 Hz)
 AGENT_LIVE_SECONDS = 90         # an agent transcript touched more recently than
                                 # this is treated as still working
+SESSION_RECENT_HOURS = 12       # chats older than this are not "waiting on you"
+EVENT_DAYS = 7                  # how far back the health view reads the event log
+ALERT_EVENT_HOURS = 72          # how recent an event must be to reach the top bar
 
 PRICES = {                      # $ per 1M tokens: in, out, cache_read, cache_write
     "claude-fable-5-1": (10, 50, .25, 20), "claude-fable-5": (10, 50, .25, 20),
+    "claude-opus-5-5": (5, 25, .5, 10),
     "claude-opus-5": (5, 25, .5, 10), "claude-opus-4-8": (5, 25, .5, 10),
     "claude-sonnet-5": (2, 10, .2, 4), "claude-sonnet-4-6": (3, 15, .3, 6),
     "claude-haiku-4-5": (1, 5, .1, 2),
 }
 LOCAL = ("gpt-oss", "qwen", "llama", "mistral")
+
+OLLAMA_PS = "http://127.0.0.1:11434/api/ps"
+
+# Script interpreters that are only ever meant to run under a parent. One of
+# these whose parent has gone is almost always something left behind.
+LEFTOVER_NAMES = {"powershell.exe", "pwsh.exe", "python.exe", "pythonw.exe", "node.exe"}
+
+# DDR5 speed grades, for reading a kit's rated speed out of its part number
+# (CMK32GX5M2B6400Z36 -> 6400). Windows only reports the JEDEC speed.
+DDR_GRADES = ("4800", "5200", "5600", "6000", "6200", "6400", "6600", "6800",
+              "7000", "7200", "7600", "8000", "8200", "8400")
 
 
 # --------------------------------------------------------------- formatting
@@ -92,20 +188,104 @@ def duration(seconds: float) -> str:
     return f"{m}m {s}s"
 
 
-def heat(frac: float) -> str:
-    """Colour name for a 0-1 load, shared by every bar so severity reads the same."""
-    if frac < 0.60:
-        return "green"
-    if frac < 0.85:
-        return "yellow"
-    return "red"
+# Severity is the only thing colour is used for. Every bar, graph, number and
+# border goes through these so "yellow" means the same thing everywhere.
+OK, WARN, CRIT = "ok", "warn", "crit"
+FILL = {OK: "grey62", WARN: "yellow", CRIT: "red"}
+NUM = {OK: "bold", WARN: "bold yellow", CRIT: "bold red"}
 
 
-def bar(frac: float, width: int = 18) -> str:
+def level(value: float, warn: float, crit: float) -> str:
+    if value >= crit:
+        return CRIT
+    if value >= warn:
+        return WARN
+    return OK
+
+
+def worst(*levels: str) -> str:
+    return CRIT if CRIT in levels else WARN if WARN in levels else OK
+
+
+def bar(frac: float, width: int = 18, lvl: str = OK) -> str:
     frac = max(0.0, min(1.0, float(frac or 0)))
     filled = int(round(frac * width))
-    colour = heat(frac)
-    return (f"[{colour}]{'█' * filled}[/][dim]{'─' * (width - filled)}[/]")
+    return f"[{FILL[lvl]}]{'█' * filled}[/][grey30]{'─' * (width - filled)}[/]"
+
+
+BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def squeeze(points: list[float], width: int) -> list[float]:
+    """Fit a history into `width` columns, keeping each column's peak so a
+    short spike is never averaged away."""
+    if width <= 0:
+        return []
+    if len(points) <= width:
+        return points
+    step = len(points) / width
+    return [max(points[int(i * step):int((i + 1) * step)] or [0.0]) for i in range(width)]
+
+
+def chart(points, width: int, height: int = 1, top: float = 100.0, lvl: str = OK) -> list[str]:
+    """A block-character graph `height` rows tall, top row first. History
+    grows in from the right; zero reads as a faint baseline, not as nothing."""
+    vals = squeeze(list(points), width)
+    pad = width - len(vals)
+    top = top or 1.0
+    # Graphs stay grey even when the reading is bad: a 90% memory graph is a
+    # solid slab, and a solid yellow slab shouts louder than the problem. The
+    # number and the card border carry the severity instead.
+    colour = "grey58"
+    rows = []
+    for r in range(height - 1, -1, -1):
+        cells = []
+        for v in vals:
+            eighths = max(0.0, min(1.0, v / top)) * height * 8 - r * 8
+            idx = 0 if eighths <= 0 else 8 if eighths >= 8 else int(round(eighths))
+            if r == 0 and v > 0 and idx == 0:
+                idx = 1                                # never draw a live value as nothing
+            cells.append(BLOCKS[idx])
+        body = "".join(cells)
+        if r == 0:
+            base = body.replace(" ", "\0")             # mark empty bottom cells
+            body = "".join(f"[grey27]▁[/]" if ch == "\0" else f"[{colour}]{ch}[/]" for ch in base)
+            rows.append(" " * pad + body)
+        else:
+            rows.append(" " * pad + f"[{colour}]{body}[/]")
+    return rows
+
+
+def disk_level(d: dict) -> str:
+    free, total = d["free"], d["total"] or 1
+    if free < 15 * 1024 ** 3 or free / total < 0.05:
+        return CRIT
+    if free < 40 * 1024 ** 3 and free / total < 0.15 or free / total < 0.10:
+        return WARN
+    return OK
+
+
+def rated_speed(part: str) -> int:
+    part = (part or "").upper()
+    m = re.search(r"KF5(\d{2})C", part)                 # Kingston Fury: KF560C36 -> 6000
+    if m:
+        return int(m.group(1)) * 100
+    for grade in reversed(DDR_GRADES):
+        if re.search(rf"(?<!\d){grade}(?!\d)", part):
+            return int(grade)
+    return 0
+
+
+def ps_json(script: str, timeout: float = 30):
+    """Run one PowerShell script that prints JSON; None on any failure."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return json.loads(out.stdout) if out.stdout.strip() else None
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------- sampling
@@ -114,7 +294,7 @@ class Series:
     """A bounded history that also answers 'what is it doing now'."""
 
     def __init__(self) -> None:
-        self.points: deque[float] = deque([0.0] * HIST, maxlen=HIST)
+        self.points: deque[float] = deque(maxlen=HIST)   # empty until sampled
 
     def push(self, value: float) -> None:
         self.points.append(float(value or 0))
@@ -130,6 +310,11 @@ class Series:
     @property
     def mean(self) -> float:
         return sum(self.points) / len(self.points) if self.points else 0.0
+
+    def recent(self, n: int) -> float:
+        """Average of the last n samples - steadier than `now` for alerts."""
+        pts = list(self.points)[-n:]
+        return sum(pts) / len(pts) if pts else 0.0
 
     def tail(self, n: int = 40) -> list[float]:
         pts = list(self.points)[-n:]
@@ -162,6 +347,50 @@ while ($true) {
     Start-Sleep -Milliseconds 850
 }
 """
+
+SYSINFO_PS = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+[pscustomobject]@{
+    ram = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object { [pscustomobject]@{
+        maker = "$($_.Manufacturer)".Trim(); part = "$($_.PartNumber)".Trim()
+        slot = "$($_.DeviceLocator)"; size = [double]$_.Capacity
+        speed = [int]$_.Speed; configured = [int]$_.ConfiguredClockSpeed } })
+    board = (Get-CimInstance Win32_BaseBoard | ForEach-Object { "$($_.Manufacturer) $($_.Product)".Trim() })
+    bios = (Get-CimInstance Win32_BIOS | ForEach-Object { [pscustomobject]@{
+        version = "$($_.SMBIOSBIOSVersion)"; date = $_.ReleaseDate.ToString('yyyy-MM-dd') } })
+    cpu = "$((Get-CimInstance Win32_Processor | Select-Object -First 1).Name)".Trim()
+    gpus = @(Get-CimInstance Win32_VideoController | ForEach-Object { [pscustomobject]@{
+        name = "$($_.Name)"; driver = "$($_.DriverVersion)"
+        date = $(if ($_.DriverDate) { $_.DriverDate.ToString('yyyy-MM-dd') } else { '' }) } })
+} | ConvertTo-Json -Compress -Depth 4
+"""
+
+# Everything in the event log that says the hardware or a driver misbehaved.
+# Readable without admin. Takes ~0.3 s, so it runs every few minutes.
+EVENTS_PS = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$since = (Get-Date).AddDays(-__DAYS__)
+$filters = @(
+    @{LogName='System'; ProviderName='Microsoft-Windows-WHEA-Logger'; StartTime=$since},
+    @{LogName='System'; ProviderName='Display'; Id=4101; StartTime=$since},
+    @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=41; StartTime=$since},
+    @{LogName='System'; ProviderName='Microsoft-Windows-WER-SystemErrorReporting'; Id=1001; StartTime=$since},
+    @{LogName='Application'; ProviderName='Application Error'; Id=1000; StartTime=$since})
+$out = foreach ($f in $filters) {
+    Get-WinEvent -FilterHashtable $f -MaxEvents 60 | ForEach-Object { [pscustomobject]@{
+        t = $_.TimeCreated.ToString('s'); id = $_.Id; p = $_.ProviderName
+        m = "$(($_.Message -split "`n")[0])".Trim() } }
+}
+ConvertTo-Json -InputObject @($out) -Compress
+"""
+
+EVENT_KINDS = {                 # (provider, id) -> (kind, severity)
+    ("Microsoft-Windows-WHEA-Logger", None): ("hardware error", CRIT),
+    ("Display", 4101): ("GPU driver crashed and recovered", WARN),
+    ("Microsoft-Windows-Kernel-Power", 41): ("unexpected shutdown or restart", WARN),
+    ("Microsoft-Windows-WER-SystemErrorReporting", 1001): ("blue screen", CRIT),
+    ("Application Error", 1000): ("app crash", OK),
+}
 
 
 class Sampler:
@@ -197,18 +426,27 @@ class Sampler:
             # takes a few seconds. Until it lands, those panels must say so
             # rather than confidently reporting zero.
             "claude_ready": False,
+            "ollama": None,             # None until first poll; {"up": bool, "models": [...]}
+            "sysinfo": None,            # RAM modules, board, BIOS, CPU, GPU driver
+            "events": None,             # event-log entries from the last EVENT_DAYS
+            "helpers": {"sessions": 0, "count": 0, "rss": 0},
+            "leftovers": [],
+            "tailscale": None,          # None = not installed, else up/down
             "errors": [],
         }
 
         self._proc_cache: dict[int, psutil.Process] = {}
+        self._cmd_cache: dict[tuple, str] = {}
         self._last_net = psutil.net_io_counters()
         self._last_disk = psutil.disk_io_counters()
         self._last_cpu_times = psutil.cpu_stats()
         self._seen_files: dict = {}
+        self._own = {os.getpid()} | {p.pid for p in psutil.Process().parents()}
 
         threading.Thread(target=self._fast_loop, daemon=True).start()
         threading.Thread(target=self._slow_loop, daemon=True).start()
         threading.Thread(target=self._gpu_loop, daemon=True).start()
+        threading.Thread(target=self._info_loop, daemon=True).start()
 
     # -- fast: every second, cheap counters only
     def _fast_loop(self) -> None:
@@ -262,12 +500,24 @@ class Sampler:
                 except Exception as exc:
                     self._note(f"claude: {exc}")
 
+    def _cmdline(self, pid: int, created: float) -> str:
+        key = (pid, created)                               # pid alone gets reused
+        if key not in self._cmd_cache:
+            try:
+                self._cmd_cache[key] = " ".join(psutil.Process(pid).cmdline())
+            except (psutil.Error, OSError):
+                self._cmd_cache[key] = ""
+        return self._cmd_cache[key]
+
     def _sample_processes(self) -> None:
         rows = []
         alive = set()
-        for proc in psutil.process_iter(["pid", "name", "memory_info", "num_threads"]):
+        for proc in psutil.process_iter(["pid", "name", "memory_info", "num_threads",
+                                         "ppid", "create_time"]):
             try:
                 pid = proc.info["pid"]
+                if pid == 0:                               # System Idle Process: idle time, not a program
+                    continue
                 alive.add(pid)
                 cached = self._proc_cache.get(pid)
                 if cached is None:
@@ -284,15 +534,60 @@ class Sampler:
                     "cpu": cpu / max(1, psutil.cpu_count(logical=True)),
                     "rss": getattr(mem, "rss", 0) or 0,
                     "threads": proc.info.get("num_threads") or 0,
+                    "ppid": proc.info.get("ppid") or 0,
+                    "created": proc.info.get("create_time") or 0,
                 })
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
         for pid in list(self._proc_cache):
             if pid not in alive:
                 self._proc_cache.pop(pid, None)
+        for key in list(self._cmd_cache):
+            if key[0] not in alive:
+                self._cmd_cache.pop(key, None)
         rows.sort(key=lambda r: -r["cpu"])
+        helpers, leftovers = self._helpers(rows)
         with self.lock:
             self.snap["procs"] = rows
+            self.snap["helpers"] = helpers
+            self.snap["leftovers"] = leftovers
+
+    def _helpers(self, rows: list[dict]) -> tuple[dict, list[dict]]:
+        """Split background processes into the ones Claude Code chats own
+        (expected: each open chat runs its own MCP servers) and ones whose
+        parent has gone (leftovers)."""
+        by_pid = {r["pid"]: r for r in rows}
+        children: dict = defaultdict(list)
+        for r in rows:
+            children[r["ppid"]].append(r)
+
+        backends = [r for r in rows if r["name"].lower() == "claude.exe"
+                    and "stream-json" in self._cmdline(r["pid"], r["created"])]
+        count = rss = 0
+        for b in backends:
+            stack = list(children[b["pid"]])
+            while stack:
+                c = stack.pop()
+                count += 1
+                rss += c["rss"]
+                stack.extend(children[c["pid"]])
+
+        leftovers = []
+        for r in rows:
+            if r["name"].lower() not in LEFTOVER_NAMES or r["pid"] in self._own:
+                continue
+            parent = by_pid.get(r["ppid"])
+            if parent and parent["created"] <= r["created"]:
+                continue                                   # parent alive (and not a reused pid)
+            cmd = self._cmdline(r["pid"], r["created"])
+            if "GPU Engine" in cmd:
+                what = "GPU counter loop from a closed UtilityBelt"
+            else:
+                script = next((Path(t.strip('"')).name for t in cmd.split()
+                               if t.strip('"').lower().endswith((".py", ".js", ".mjs", ".ps1"))), "")
+                what = script or cmd[:60] or r["name"]
+            leftovers.append(dict(r, what=what, age=time.time() - r["created"]))
+        return {"sessions": len(backends), "count": count, "rss": rss}, leftovers
 
     def _sample_disks(self) -> None:
         out = []
@@ -310,7 +605,7 @@ class Sampler:
                 "total": usage.total, "used": usage.used,
                 "free": usage.free, "percent": usage.percent,
             })
-        out.sort(key=lambda d: -d["total"])
+        out.sort(key=lambda d: d["device"])
         with self.lock:
             self.snap["disks"] = out
             self.snap["per_disk"] = {
@@ -323,6 +618,10 @@ class Sampler:
         per_nic = psutil.net_io_counters(pernic=True) or {}
         stats = psutil.net_if_stats() or {}
         out = []
+        tailscale = None
+        for name, st in stats.items():
+            if "tailscale" in name.lower():
+                tailscale = bool(tailscale) or st.isup
         for name, io in per_nic.items():
             st = stats.get(name)
             if st is None or not st.isup:
@@ -339,6 +638,7 @@ class Sampler:
         out.sort(key=lambda n: -(n["sent"] + n["recv"]))
         with self.lock:
             self.snap["nets"] = out
+            self.snap["tailscale"] = tailscale
 
     # -- GPU: one long-lived PowerShell, read line by line
     def _gpu_loop(self) -> None:
@@ -354,6 +654,7 @@ class Sampler:
         except Exception as exc:
             self._note(f"gpu spawn: {exc}")
             return
+        _die_with_this_process(proc)
         buf = ""
         for line in proc.stdout:                            # blocks; own thread
             if self.stop.is_set():
@@ -379,6 +680,68 @@ class Sampler:
             proc.terminate()
         except Exception:
             pass
+
+    # -- info: Ollama every 5 s, event log every 5 min, inventory once
+    def _info_loop(self) -> None:
+        tick = 0
+        while not self.stop.is_set():
+            try:
+                self._sample_ollama()
+            except Exception as exc:
+                self._note(f"ollama: {exc}")
+            if sys.platform == "win32":
+                if tick == 0:
+                    info = ps_json(SYSINFO_PS)
+                    with self.lock:
+                        self.snap["sysinfo"] = info or {}
+                if tick % 60 == 0:
+                    self._sample_events()
+            tick += 1
+            if self.stop.wait(5.0):
+                break
+
+    def _sample_ollama(self) -> None:
+        try:
+            with urllib.request.urlopen(OLLAMA_PS, timeout=1.0) as resp:
+                data = json.load(resp)
+        except Exception:
+            with self.lock:
+                self.snap["ollama"] = {"up": False, "models": []}
+            return
+        models = []
+        for m in data.get("models") or []:
+            expires = m.get("expires_at") or ""
+            try:                                           # Ollama writes 7 fraction digits
+                until = datetime.fromisoformat(re.sub(r"\.\d+", "", expires)).timestamp()
+            except ValueError:
+                until = 0
+            models.append({"name": (m.get("name") or "?").removesuffix(":latest"),
+                           "vram": m.get("size_vram") or 0, "size": m.get("size") or 0,
+                           "params": (m.get("details") or {}).get("parameter_size") or "",
+                           "context": m.get("context_length") or 0, "until": until})
+        with self.lock:
+            self.snap["ollama"] = {"up": True, "models": models}
+
+    def _sample_events(self) -> None:
+        raw = ps_json(EVENTS_PS.replace("__DAYS__", str(EVENT_DAYS)))
+        if raw is None:
+            return
+        out = []
+        for e in raw if isinstance(raw, list) else [raw]:
+            key = (e.get("p"), e.get("id"))
+            kind, sev = EVENT_KINDS.get(key) or EVENT_KINDS.get((e.get("p"), None)) or ("event", OK)
+            detail = e.get("m") or ""
+            m = re.search(r"Faulting application name: ([^,]+)", detail)
+            if m:
+                detail = m.group(1)
+            try:
+                when = datetime.fromisoformat(e.get("t") or "").timestamp()
+            except ValueError:
+                continue
+            out.append({"when": when, "kind": kind, "sev": sev, "detail": detail})
+        out.sort(key=lambda e: -e["when"])
+        with self.lock:
+            self.snap["events"] = out
 
     # -- Claude transcripts and live agents
     def _sample_claude(self) -> None:
@@ -412,6 +775,7 @@ class Sampler:
                 record["live"] = age < AGENT_LIVE_SECONDS
                 agents.append(record)
             else:
+                record["state"] = session_state(info["last_kind"], age)
                 sessions.append(record)
                 today_calls += info["today_calls"]
                 for model, vals in info["today_models"].items():
@@ -441,9 +805,10 @@ class Sampler:
         models: dict = defaultdict(lambda: [0, 0, 0, 0])
         today_models: dict = defaultdict(lambda: [0, 0, 0, 0])
         calls = today_calls = 0
-        title = ""
+        title = custom_title = ""
         last_tool = ""
         last_text = ""
+        last_kind = ""
         try:
             fh = path.open(encoding="utf-8", errors="replace")
         except OSError:
@@ -457,20 +822,29 @@ class Sampler:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if entry.get("type") == "custom-title" and entry.get("customTitle"):
+                    custom_title = str(entry["customTitle"])
                 message = entry.get("message") or {}
-                if not title and entry.get("type") == "user":
-                    content = message.get("content")
-                    if isinstance(content, str):
-                        title = content.strip().replace("\n", " ")[:60]
+                if entry.get("type") == "user" and not entry.get("isSidechain"):
+                    last_kind = "user"
+                    if not title:
+                        content = message.get("content")
+                        if isinstance(content, str):
+                            title = content.strip().replace("\n", " ")[:60]
                 if entry.get("type") != "assistant":
                     continue
+                has_tool = False
                 for block in (message.get("content") or []):
                     if not isinstance(block, dict):
                         continue
                     if block.get("type") == "tool_use":
                         last_tool = block.get("name") or ""
+                        has_tool = True
                     elif block.get("type") == "text" and block.get("text"):
                         last_text = str(block["text"]).strip().replace("\n", " ")[:70]
+                if not entry.get("isSidechain"):
+                    last_kind = ("end_turn" if message.get("stop_reason") == "end_turn"
+                                 else "tool_use" if has_tool else "assistant")
                 usage = message.get("usage")
                 if not usage:
                     continue
@@ -495,7 +869,7 @@ class Sampler:
             return None
         return {
             "id": path.stem.replace("agent-", "")[:10],
-            "title": title or last_text or "(no prompt text)",
+            "title": custom_title or title or last_text or "(no prompt text)",
             "calls": calls,
             "today_calls": today_calls,
             "models": dict(models),
@@ -504,6 +878,7 @@ class Sampler:
             "output": sum(v[3] for v in models.values()),
             "cost": sum(cost_of(m, v) for m, v in models.items()),
             "last_tool": last_tool,
+            "last_kind": last_kind,
             "workflow": path.parent.name if path.parent.name.startswith("wf_") else "",
         }
 
@@ -520,6 +895,29 @@ class Sampler:
             return dict(self.snap)
 
 
+def session_state(last_kind: str, age: float) -> str:
+    """What a chat is doing, read from how its transcript ends.
+
+    Claude finished its reply        -> waiting on you
+    Written to in the last 90 s      -> working
+    Ends on a tool call, then silent -> probably waiting for a permission
+                                        prompt (or a very long command)
+    """
+    if age > SESSION_RECENT_HOURS * 3600:
+        return "old"
+    if last_kind == "end_turn":
+        return "waiting"
+    if age < AGENT_LIVE_SECONDS:
+        return "working"
+    if last_kind == "tool_use":
+        return "approval"
+    return "idle"
+
+
+STATE_LABEL = {"working": "working", "waiting": "waiting on you",
+               "approval": "may need approval", "idle": "idle", "old": "old"}
+
+
 def cost_of(model: str, tokens) -> float:
     if any(x in model for x in LOCAL):
         return 0.0
@@ -530,19 +928,107 @@ def cost_of(model: str, tokens) -> float:
             + tokens[2] * price[2] + tokens[1] * price[3]) / 1e6
 
 
-# -------------------------------------------------------------------- cards
+# ------------------------------------------------------------------- alerts
+
+def ram_speed(snap: dict) -> tuple[int, int]:
+    """(running MT/s, rated MT/s); 0 where unknown."""
+    mods = (snap.get("sysinfo") or {}).get("ram") or []
+    if isinstance(mods, dict):
+        mods = [mods]
+    running = min((m.get("configured") or m.get("speed") or 0 for m in mods), default=0)
+    rated = min((rated_speed(m.get("part")) for m in mods), default=0)
+    return running, rated
+
+
+def compute_alerts(snap: dict, s: Sampler) -> list[dict]:
+    """Everything that deserves the top bar, worst first. Each has a short
+    label for the bar and a sentence for the health view."""
+    out = []
+
+    def add(lvl, short, long):
+        out.append({"lvl": lvl, "short": short, "long": long})
+
+    total = snap.get("vram_total") or 0
+    if total:
+        vpct = (snap.get("vram_used") or 0) / total * 100
+        lvl = level(vpct, 90, 97)
+        if lvl != OK:
+            models = (snap.get("ollama") or {}).get("models") or []
+            why = (f" Ollama is holding {models[0]['name']} "
+                   f"({human_bytes(models[0]['vram'])}) until "
+                   f"{datetime.fromtimestamp(models[0]['until']):%H:%M}."
+                   if models and models[0]["until"] else "")
+            add(lvl, f"VRAM {vpct:.0f}%",
+                f"Video memory is {vpct:.0f}% full, so games and models may slow "
+                f"down or fail to load.{why}")
+
+    vm = snap.get("mem")
+    if vm:
+        lvl = level(s.mem.recent(30), 85, 93)
+        if lvl != OK:
+            add(lvl, f"memory {vm.percent:.0f}%",
+                f"System memory is {vm.percent:.0f}% used; Windows will start "
+                f"swapping to disk.")
+
+    lvl = level(s.cpu.recent(60), 85, 95)
+    if lvl != OK:
+        add(lvl, f"CPU {s.cpu.recent(60):.0f}% for 1 min",
+            "The processor has been nearly flat out for the last minute.")
+
+    running, rated = ram_speed(snap)
+    if running and rated and running < rated - 100:
+        add(WARN, f"RAM speed {running} of {rated}",
+            f"Your RAM is rated for {rated} MT/s but running at {running}. "
+            f"EXPO is probably off in the BIOS (Ai Tweaker > Ai Overclock Tuner > EXPO I).")
+
+    for d in snap.get("disks") or []:
+        lvl = disk_level(d)
+        if lvl != OK:
+            add(lvl, f"{d['device']} {human_bytes(d['free'])} free",
+                f"Drive {d['device']} has {human_bytes(d['free'])} free "
+                f"({100 - d['percent']:.0f}%). disk-sentinel.py shows what is using it.")
+
+    now = time.time()
+    recent = [e for e in snap.get("events") or [] if now - e["when"] < ALERT_EVENT_HOURS * 3600]
+    for kind in ("hardware error", "blue screen", "GPU driver crashed and recovered",
+                 "unexpected shutdown or restart"):
+        hits = [e for e in recent if e["kind"] == kind]
+        if hits:
+            sev = hits[0]["sev"]
+            label = {"hardware error": "hardware error", "blue screen": "blue screen",
+                     "GPU driver crashed and recovered": "GPU driver reset",
+                     "unexpected shutdown or restart": "unexpected restart"}[kind]
+            add(sev, f"{len(hits)} {label}{'s' if len(hits) > 1 else ''}",
+                f"{len(hits)} × {kind} in the last {ALERT_EVENT_HOURS // 24} days, "
+                f"most recently {datetime.fromtimestamp(hits[0]['when']):%a %H:%M}.")
+
+    left = snap.get("leftovers") or []
+    if left:
+        add(WARN, f"{len(left)} leftover process{'es' if len(left) > 1 else ''}",
+            f"{len(left)} script process(es) are still running although whatever "
+            f"started them has closed. Details under h.")
+
+    out.sort(key=lambda a: a["lvl"] != CRIT)
+    return out
+
+
+# -------------------------------------------------------------------- views
 
 class Card(Static):
-    """One clickable panel on the overview grid."""
+    """One clickable panel on the standard grid."""
 
     def __init__(self, key: str, title: str, index: int) -> None:
         super().__init__(id=f"card-{key}", classes="card")
         self.key = key
-        self.title_text = title
-        self.index = index
+        self.border_title = f"{index} {title}"
 
     def on_click(self, event: events.Click) -> None:
         self.app.open_detail(self.key)
+
+
+class TopBar(Static):
+    def on_click(self, event: events.Click) -> None:
+        self.app.open_detail("health")
 
 
 class Overview(Screen):
@@ -553,46 +1039,79 @@ class Overview(Screen):
     ]
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield TopBar(id="topbar")
         with Grid(id="grid"):
             for i, (key, title) in enumerate(self.CARDS, start=1):
                 yield Card(key, title, i)
-        yield Static(id="statusline")
-        yield Footer()
+        yield Static(id="hint")
+        yield Static(id="mini")
 
     def on_mount(self) -> None:
         self.set_interval(1.0, self.redraw)
+        self.apply_mode()
         self.redraw()
 
+    def on_resize(self, event: events.Resize) -> None:
+        self.apply_mode()
+        self.redraw()
+
+    def is_mini(self) -> bool:
+        forced = self.app.forced_mode
+        if forced:
+            return forced == "mini"
+        return self.size.height < 16 or self.size.width < 90
+
+    def apply_mode(self) -> None:
+        self.set_class(self.is_mini(), "-mini")
+        grid = self.query_one("#grid", Grid)
+        wide = self.size.width >= 128
+        grid.styles.grid_size_columns = 4 if wide else 2
+        grid.styles.grid_size_rows = 2 if wide else 4
+
     def redraw(self) -> None:
-        snap = self.app.sampler.read()
+        app = self.app
+        snap = app.sampler.read()
+        alerts = compute_alerts(snap, app.sampler)
+        if self.is_mini():
+            self.query_one("#mini", Static).update(app.render_mini(snap, alerts, self.size.width - 2))
+            return
+        self.query_one("#topbar", TopBar).update(app.render_topbar(alerts, self.size.width - 4))
         for key, _ in self.CARDS:
             try:
                 card = self.query_one(f"#card-{key}", Card)
             except Exception:
                 continue
-            card.update(self.app.render_card(key, snap, card))
-        uptime = duration(time.time() - snap.get("boot", time.time()))
+            w = max(10, card.size.width - 4)
+            h = max(3, card.size.height - 2)
+            try:
+                lines, lvl = getattr(app, f"_card_{key}")(snap, app.sampler, w, h)
+            except Exception as exc:
+                lines, lvl = [f"[red]{escape(type(exc).__name__)}: {escape(str(exc))}[/]"], WARN
+            card.set_class(lvl == WARN, "warn")
+            card.set_class(lvl == CRIT, "crit")
+            card.update("\n".join(lines[:h]))
         errs = snap.get("errors") or []
-        note = f"  [red]{errs[-1]}[/]" if errs else ""
-        self.query_one("#statusline", Static).update(
-            f"[dim]up {uptime}  ·  {snap['claude']['scanned']} transcripts  ·  "
-            f"click a panel or press 1-8 for detail  ·  costs are API list rates, "
-            f"not your bill[/]{note}")
+        note = f"   [red]{escape(errs[-1])}[/]" if errs else ""
+        self.query_one("#hint", Static).update(
+            "[dim]1-8 open a panel · h health · m mini view · q quit[/]" + note)
 
 
 class Detail(Screen):
     BINDINGS = [("escape", "app.pop_screen", "Back"), ("q", "app.pop_screen", "Back")]
+
+    TITLES = {"cpu": "CPU", "memory": "Memory", "gpu": "GPU", "storage": "Storage",
+              "network": "Network", "claude": "Claude", "agents": "Agents",
+              "processes": "Processes", "health": "Health"}
 
     def __init__(self, key: str) -> None:
         super().__init__()
         self.key = key
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Static(id="dtitle")
         with VerticalScroll(id="detail-body"):
             yield Static(id="detail-content")
-        yield Footer()
+        yield Static(id="dhint")
 
     def on_mount(self) -> None:
         self.set_interval(1.0, self.redraw)
@@ -600,8 +1119,13 @@ class Detail(Screen):
 
     def redraw(self) -> None:
         snap = self.app.sampler.read()
+        self.query_one("#dtitle", Static).update(
+            f"[bold]UtilityBelt[/] [dim]›[/] [bold]{self.TITLES.get(self.key, self.key)}[/]"
+            f"   [dim]{datetime.now():%H:%M:%S}[/]")
         self.query_one("#detail-content", Static).update(
-            self.app.render_detail(self.key, snap))
+            self.app.render_detail(self.key, snap, max(40, self.size.width - 8)))
+        self.query_one("#dhint", Static).update(
+            "[dim]esc back · 1-8 other panels · h health · q back[/]")
 
 
 # ---------------------------------------------------------------------- app
@@ -609,20 +1133,32 @@ class Detail(Screen):
 class Belt(App):
     CSS = """
     Screen { background: $surface; }
+    #topbar { height: 1; padding: 0 2; background: $panel; }
     #grid {
         layout: grid;
         grid-size: 4 2;
-        grid-gutter: 1 2;
-        padding: 1 2;
+        grid-gutter: 0 1;
+        padding: 1 1 0 1;
     }
     .card {
-        border: round $primary 40%;
+        border: round $panel-lighten-3;
+        border-title-color: $text-muted;
+        border-title-style: bold;
         padding: 0 1;
         height: 100%;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
-    .card:hover { border: round $accent; background: $boost; }
-    #statusline { padding: 0 3; height: 1; }
+    .card.warn { border: round $warning 70%; border-title-color: $warning; }
+    .card.crit { border: round $error; border-title-color: $error; }
+    .card:hover { border: round $accent; }
+    #hint { height: 1; padding: 0 2; }
+    #mini { display: none; padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    Overview.-mini #topbar, Overview.-mini #grid, Overview.-mini #hint { display: none; }
+    Overview.-mini #mini { display: block; height: 100%; }
+    #dtitle { height: 1; padding: 0 2; background: $panel; }
     #detail-body { padding: 1 3; }
+    #dhint { height: 1; padding: 0 2; }
     """
 
     BINDINGS = [
@@ -635,13 +1171,16 @@ class Belt(App):
         ("6", "detail('claude')", "Claude"),
         ("7", "detail('agents')", "Agents"),
         ("8", "detail('processes')", "Processes"),
+        ("h", "detail('health')", "Health"),
+        ("m", "toggle_mini", "Mini"),
     ]
 
     TITLE = "UtilityBelt"
 
-    def __init__(self, sampler: Sampler) -> None:
+    def __init__(self, sampler: Sampler, mini: bool = False) -> None:
         super().__init__()
         self.sampler = sampler
+        self.forced_mode = "mini" if mini else None
 
     def on_mount(self) -> None:
         self.push_screen(Overview())
@@ -649,232 +1188,395 @@ class Belt(App):
     def action_detail(self, key: str) -> None:
         self.open_detail(key)
 
+    def action_toggle_mini(self) -> None:
+        while isinstance(self.screen, Detail):
+            self.pop_screen()
+        overview = self.screen
+        if isinstance(overview, Overview):
+            self.forced_mode = "full" if overview.is_mini() else "mini"
+            overview.apply_mode()
+            overview.redraw()
+
     def open_detail(self, key: str) -> None:
         if isinstance(self.screen, Detail):
             self.pop_screen()
         self.push_screen(Detail(key))
 
-    # ---- overview card bodies
+    # ---- top bar and mini strip
 
-    def render_card(self, key: str, snap: dict, card: Card) -> str:
+    @staticmethod
+    def _alert_text(alerts: list[dict], limit: int = 4) -> str:
+        if not alerts:
+            return "[green]✓[/] [dim]all good[/]"
+        shown = " [dim]·[/] ".join(
+            f"[{FILL[a['lvl']]}]{escape(a['short'])}[/]" for a in alerts[:limit])
+        more = f" [dim]+{len(alerts) - limit} more[/]" if len(alerts) > limit else ""
+        mark = "[red]●[/]" if alerts[0]["lvl"] == CRIT else "[yellow]⚠[/]"
+        return f"{mark} {shown}{more}"
+
+    @staticmethod
+    def _line(left: str, right: str, width: int) -> Text:
+        """left-aligned markup and a right-aligned tail on one line, the left
+        side cut short (with an ellipsis) rather than wrapping."""
+        l, r = Text.from_markup(left), Text.from_markup(right)
+        room = width - r.cell_len - 2
+        if l.cell_len > room:
+            l.truncate(max(0, room), overflow="ellipsis")
+        l.append(" " * max(1, width - l.cell_len - r.cell_len))
+        l.append_text(r)
+        return l
+
+    def render_topbar(self, alerts: list[dict], width: int) -> Text:
+        return self._line(f"[bold]UtilityBelt[/]   {self._alert_text(alerts)}",
+                          f"[dim]{datetime.now():%H:%M:%S}[/]", width)
+
+    def render_mini(self, snap: dict, alerts: list[dict], width: int) -> Text:
         s = self.sampler
-        head = f"[bold]{card.index} {card.title_text}[/]"
-        try:
-            body = getattr(self, f"_card_{key}")(snap, s)
-        except Exception as exc:
-            body = f"[red]{type(exc).__name__}: {exc}[/]"
-        return f"{head}\n{body}"
+        vtotal = snap.get("vram_total") or 0
+        vpct = (snap.get("vram_used") or 0) / vtotal * 100 if vtotal else 0
+        vm = snap.get("mem")
+        cpu_l = level(s.cpu.recent(10), 85, 95)
+        v_l = level(vpct, 90, 97)
+        m_l = level(vm.percent if vm else 0, 85, 93)
+        spark_w = 8 if width >= 100 else 5
 
-    def _card_cpu(self, snap, s) -> str:
-        pct = s.cpu.now
-        cores = len(s.cpu_cores)
-        hot = sorted((c.now for c in s.cpu_cores), reverse=True)[:1]
+        parts = [
+            f"CPU [{NUM[cpu_l]}]{s.cpu.now:3.0f}%[/] {chart(s.cpu.points, spark_w, lvl=cpu_l)[0]}",
+            f"GPU [bold]{s.gpu.now:3.0f}%[/] {chart(s.gpu.points, spark_w)[0]}",
+            f"VRAM [{NUM[v_l]}]{vpct:.0f}%[/]",
+            f"MEM [{NUM[m_l]}]{vm.percent if vm else 0:.0f}%[/]",
+        ]
+        tight = sorted(snap.get("disks") or [], key=lambda d: d["free"])
+        if tight:
+            d = tight[0]
+            parts.append(f"{d['device']} [{NUM[disk_level(d)]}]{human_bytes(d['free'])}[/] free")
+        line1 = "   ".join(parts)
+
+        net = f"↓ {rate(s.net_down.now)}  ↑ {rate(s.net_up.now)}"
+        ts = snap.get("tailscale")
+        if ts is not None:
+            net += "   Tailscale " + ("[green]✓[/]" if ts else "[yellow]off[/]")
+        line2 = f"{net}   {self._claude_summary(snap)}"
+
+        return Text("\n").join([
+            self._line(line1, "", width),
+            self._line(line2, "", width),
+            self._line(self._alert_text(alerts, limit=3),
+                       f"[dim]{datetime.now():%H:%M}[/]", width),
+        ])
+
+    @staticmethod
+    def _claude_summary(snap: dict) -> str:
+        if not snap.get("claude_ready"):
+            return "[dim]Claude: scanning…[/]"
+        c = snap["claude"]
+        states = Counter(x["state"] for x in c["sessions"])
+        live = sum(1 for a in snap.get("agents") or [] if a["live"])
+        bits = [f"Claude [bold]${c['today_cost']:,.0f}[/] today"]
+        if states["waiting"]:
+            bits.append(f"[bold]{states['waiting']}[/] waiting on you")
+        if states["approval"]:
+            bits.append(f"[yellow]{states['approval']} may need approval[/]")
+        if states["working"] or live:
+            bits.append(f"{states['working'] + live} working")
+        return " · ".join(bits)
+
+    # ---- standard cards: (lines, severity)
+
+    @staticmethod
+    def _graph_rows(h: int, fixed: int) -> int:
+        """Graphs take whatever height the card has left over."""
+        return max(1, min(12, h - fixed))
+
+    def _card_cpu(self, snap, s, w, h):
+        lvl = level(s.cpu.recent(10), 85, 95)
         freq = snap.get("cpu_freq") or 0
-        return (f"{bar(pct / 100)} [bold]{pct:4.1f}%[/]\n"
-                f"[dim]{cores} threads · peak core {hot[0] if hot else 0:.0f}% · "
-                f"{freq / 1000:.1f} GHz[/]\n"
-                f"[dim]2m avg {s.cpu.mean:.0f}% · max {s.cpu.peak:.0f}%[/]")
+        busiest = max((c.now for c in s.cpu_cores), default=0)
+        lines = [f"[{NUM[lvl]}]{s.cpu.now:.0f}%[/]  [dim]{freq / 1000:.1f} GHz[/]"]
+        lines += chart(s.cpu.points, w, self._graph_rows(h, 2), lvl=lvl)
+        lines.append(f"[dim]busiest core {busiest:.0f}% · 5 min avg {s.cpu.mean:.0f}%[/]")
+        return lines, lvl
 
-    def _card_memory(self, snap, s) -> str:
+    def _card_memory(self, snap, s, w, h):
         vm = snap.get("mem")
         if not vm:
-            return "[dim]sampling…[/]"
-        sw = snap.get("swap")
-        swap_line = (f"\n[dim]swap {sw.percent:.0f}% of {human_bytes(sw.total)}[/]"
-                     if sw else "")
-        return (f"{bar(vm.percent / 100)} [bold]{vm.percent:4.1f}%[/]\n"
-                f"[dim]{human_bytes(vm.used)} of {human_bytes(vm.total)} · "
-                f"{human_bytes(vm.available)} free[/]"
-                f"{swap_line}")
+            return ["[dim]sampling…[/]"], OK
+        lvl = level(s.mem.recent(30), 85, 93)
+        lines = [f"[{NUM[lvl]}]{vm.percent:.0f}%[/]  [dim]{human_bytes(vm.used)} of "
+                 f"{human_bytes(vm.total)}[/]"]
+        lines += chart(s.mem.points, w, self._graph_rows(h, 2), lvl=lvl)
+        running, rated = ram_speed(snap)
+        if running and rated and running < rated - 100:
+            lines.append(f"[yellow]RAM {running} MT/s · rated {rated}[/]")
+            lvl = worst(lvl, WARN)
+        elif running:
+            lines.append(f"[dim]RAM {running} MT/s · {human_bytes(vm.available)} free[/]")
+        else:
+            lines.append(f"[dim]{human_bytes(vm.available)} free[/]")
+        return lines, lvl
 
-    def _card_gpu(self, snap, s) -> str:
+    def _card_gpu(self, snap, s, w, h):
         used = snap.get("vram_used") or 0
         total = snap.get("vram_total") or 0
-        pct = s.gpu.now
-        if total == 0 and pct == 0:
-            return "[dim]waiting for counters…[/]"
-        vfrac = used / total if total else 0
-        return (f"{bar(pct / 100)} [bold]{pct:4.1f}%[/] [dim]load[/]\n"
-                f"{bar(vfrac)} [bold]{vfrac * 100:4.1f}%[/] [dim]vram[/]\n"
-                f"[dim]{human_bytes(used)} of {human_bytes(total)}[/]")
+        if total == 0 and s.gpu.now == 0:
+            return ["[dim]waiting for counters…[/]"], OK
+        vpct = used / total * 100 if total else 0
+        v_l = level(vpct, 90, 97)
+        lines = [f"[bold]{s.gpu.now:.0f}%[/] [dim]load[/]   VRAM [{NUM[v_l]}]{vpct:.0f}%[/]"]
+        lines += chart(s.gpu.points, w, self._graph_rows(h, 2))
+        ol = snap.get("ollama")
+        if ol is None:
+            lines.append("[dim]checking Ollama…[/]")
+        elif not ol["up"]:
+            lines.append("[dim]Ollama not running[/]")
+        elif ol["models"]:
+            m = ol["models"][0]
+            more = f" +{len(ol['models']) - 1}" if len(ol["models"]) > 1 else ""
+            lines.append(f"[dim]ollama[/] {escape(m['name'])} [dim]{human_bytes(m['vram'])}{more}[/]")
+        else:
+            lines.append("[dim]Ollama idle · no model loaded[/]")
+        return lines, v_l
 
-    def _card_storage(self, snap, s) -> str:
+    def _card_storage(self, snap, s, w, h):
         disks = snap.get("disks") or []
         if not disks:
-            return "[dim]sampling…[/]"
-        lines = []
-        for d in disks[:4]:
-            lines.append(f"[dim]{d['device']:<3}[/]{bar(d['percent'] / 100, 12)} "
-                         f"[dim]{human_bytes(d['free'])} free[/]")
-        lines.append(f"[dim]r {rate(s.disk_read.now)} · w {rate(s.disk_write.now)}[/]")
-        return "\n".join(lines)
+            return ["[dim]sampling…[/]"], OK
+        lines, lvl = [], OK
+        bw = max(4, w - 17)
+        for d in disks[:max(1, h - 1)]:
+            dl = disk_level(d)
+            lvl = worst(lvl, dl)
+            lines.append(f"{d['device']:<3}{bar(d['percent'] / 100, bw, dl)} "
+                         f"[{NUM[dl] if dl != OK else 'default'}]{human_bytes(d['free']):>8}[/] [dim]free[/]")
+        lines.append(f"[dim]read {rate(s.disk_read.now)} · write {rate(s.disk_write.now)}[/]")
+        return lines, lvl
 
-    def _card_network(self, snap, s) -> str:
-        return (f"[green]▼[/] [bold]{rate(s.net_down.now)}[/]\n"
-                f"[cyan]▲[/] [bold]{rate(s.net_up.now)}[/]\n"
-                f"[dim]peak ▼{rate(s.net_down.peak)} ▲{rate(s.net_up.peak)}[/]")
+    def _card_network(self, snap, s, w, h):
+        lines = [f"↓ [bold]{rate(s.net_down.now)}[/]   ↑ [bold]{rate(s.net_up.now)}[/]"]
+        top = max(s.net_down.peak, s.net_up.peak, 64 * 1024)
+        lines += chart(s.net_down.points, w, self._graph_rows(h, 2), top=top)
+        ts = snap.get("tailscale")
+        tail = [f"[dim]peak ↓ {rate(s.net_down.peak)}[/]"]
+        if ts is not None:
+            tail.insert(0, "Tailscale " + ("[green]connected[/]" if ts else "[yellow]off[/]"))
+        lines.append(" [dim]·[/] ".join(tail))
+        return lines, OK
 
-    def _card_claude(self, snap, s) -> str:
+    def _card_claude(self, snap, s, w, h):
         if not snap.get("claude_ready"):
-            return "[dim]scanning transcripts…[/]"
+            return ["[dim]scanning transcripts…[/]"], OK
         c = snap["claude"]
-        cr = sum(v[2] for v in c["models"].values())
-        out = sum(v[3] for v in c["models"].values())
-        resend = cr / (cr + out) * 100 if (cr + out) else 0
-        return (f"[bold]{c['today_calls']:,}[/] calls today  [dim]~${c['today_cost']:,.2f}[/]\n"
-                f"[dim]{len(c['sessions'])} sessions · "
-                f"${sum(x['cost'] for x in c['sessions']):,.0f} all time[/]\n"
-                f"[dim]resend {resend:.1f}% · {cr / 1e9:.2f}B cached[/]")
+        lines = [f"[bold]${c['today_cost']:,.2f}[/] [dim]today · {c['today_calls']:,} calls[/]"]
+        order = {"approval": 0, "waiting": 1, "working": 2}
+        active = sorted((x for x in c["sessions"] if x["state"] in order),
+                        key=lambda x: (order[x["state"]], x["age"]))
+        if not active:
+            lines.append("[dim]no chats active in the last 12h[/]")
+        for x in active[:h - 1]:
+            mark = {"approval": "[yellow]?[/]", "waiting": "[bold]◆[/]",
+                    "working": "[green]●[/]"}[x["state"]]
+            lines.append(f"{mark} {escape(x['title'])}")
+        lvl = WARN if any(x["state"] == "approval" for x in active) else OK
+        return lines, lvl
 
-    def _card_agents(self, snap, s) -> str:
+    def _card_agents(self, snap, s, w, h):
         if not snap.get("claude_ready"):
-            return "[dim]scanning transcripts…[/]"
+            return ["[dim]scanning transcripts…[/]"], OK
         agents = snap.get("agents") or []
-        live = [a for a in agents if a["live"]]
         if not agents:
-            return "[dim]no agent transcripts[/]"
-        lines = [f"[bold]{len(live)}[/] live [dim]of {len(agents)} seen[/]"]
-        for a in live[:2]:
-            tool = a["last_tool"] or "thinking"
-            lines.append(f"[green]●[/] [dim]{a['id']}[/] {tool}")
+            return ["[dim]no agent transcripts[/]"], OK
+        live = [a for a in agents if a["live"]]
+        lines = [f"[bold]{len(live)}[/] [dim]working now[/]"]
+        for a in live[:h - 1]:
+            lines.append(f"[green]●[/] {a['last_tool'] or 'thinking'} [dim]· "
+                         f"{escape(a['title'])}[/]")
         if not live:
-            lines.append(f"[dim]last: {agents[0]['id']} "
-                         f"{duration(agents[0]['age'])} ago[/]")
-        return "\n".join(lines)
+            lines.append(f"[dim]last one finished {duration(agents[0]['age'])} ago[/]")
+        return lines, OK
 
-    def _card_processes(self, snap, s) -> str:
+    def _card_processes(self, snap, s, w, h):
         procs = snap.get("procs") or []
         if not procs:
-            return "[dim]sampling…[/]"
-        lines = []
-        for p in procs[:3]:
-            lines.append(f"[dim]{p['name'][:14]:<14}[/]{p['cpu']:5.1f}%  "
-                         f"[dim]{human_bytes(p['rss'])}[/]")
-        return "\n".join(lines)
+            return ["[dim]sampling…[/]"], OK
+        left = snap.get("leftovers") or []
+        hp = snap.get("helpers") or {}
+        tail = []
+        if hp.get("sessions"):
+            tail.append(f"[dim]{hp['sessions']} Claude chats loaded · "
+                        f"{hp['count']} helpers · {human_bytes(hp['rss'])}[/]")
+        if left:
+            tail.append(f"[yellow]{len(left)} leftover process{'es' if len(left) > 1 else ''}[/]")
+        top = [f"{escape(p['name'][:16]):<16} [bold]{p['cpu']:4.1f}%[/] [dim]{human_bytes(p['rss'])}[/]"
+               for p in procs[:max(1, min(5, h - len(tail) - 1))]]
+        gap = [""] * max(0, h - len(top) - len(tail))
+        return top + gap + tail, WARN if left else OK
 
     # ---- detail bodies
 
-    def render_detail(self, key: str, snap: dict) -> str:
+    def render_detail(self, key: str, snap: dict, width: int) -> str:
         try:
-            return getattr(self, f"_detail_{key}")(snap, self.sampler)
+            return getattr(self, f"_detail_{key}")(snap, self.sampler, width)
         except Exception as exc:
-            return f"[red]{type(exc).__name__}: {exc}[/]"
+            return f"[red]{escape(type(exc).__name__)}: {escape(str(exc))}[/]"
 
-    def _detail_cpu(self, snap, s) -> str:
-        out = [f"[bold]CPU[/]  [dim]{snap['cpu_physical']} cores / "
-               f"{snap['cpu_logical']} threads[/]", ""]
-        out.append(f"total   {bar(s.cpu.now / 100, 30)} [bold]{s.cpu.now:5.1f}%[/]")
-        out.append(f"[dim]2 min average {s.cpu.mean:.1f}%   peak {s.cpu.peak:.1f}%[/]")
-        out.append("")
-        out.append("[bold]per thread[/]")
+    @staticmethod
+    def _graph(points, width, lvl=OK, top=100.0, label="") -> list[str]:
+        rows = chart(points, min(width, 120), 5, top=top, lvl=lvl)
+        return rows + [f"[dim]{'5 minutes ago':<{min(width, 120) - 3}}now[/]"
+                       + (f"  [dim]{label}[/]" if label else "")]
+
+    def _detail_cpu(self, snap, s, width) -> str:
+        lvl = level(s.cpu.recent(10), 85, 95)
+        out = [f"[{NUM[lvl]}]{s.cpu.now:.1f}%[/]  [dim]{snap['cpu_physical']} cores / "
+               f"{snap['cpu_logical']} threads · 5 min avg {s.cpu.mean:.1f}% · "
+               f"peak {s.cpu.peak:.1f}%[/]", ""]
+        out += self._graph(s.cpu.points, width, lvl)
+        out += ["", "[bold]per thread[/]"]
         for i, core in enumerate(s.cpu_cores):
-            out.append(f"  {i:>2}  {bar(core.now / 100, 26)} {core.now:5.1f}% "
+            cl = level(core.now, 85, 95)
+            out.append(f"  {i:>2}  {bar(core.now / 100, 26, cl)} {core.now:5.1f}% "
                        f"[dim]avg {core.mean:4.1f}%[/]")
         freq, fmax = snap.get("cpu_freq") or 0, snap.get("cpu_freq_max") or 0
-        out += ["", "[bold]clocks and interrupts[/]",
-                f"  frequency      {freq / 1000:.2f} GHz"
-                + (f" [dim]of {fmax / 1000:.2f} GHz[/]" if fmax else ""),
+        info = snap.get("sysinfo") or {}
+        out += ["", "[bold]clocks and interrupts[/]"]
+        if info.get("cpu"):
+            out.append(f"  processor        {escape(info['cpu'])}")
+        out += [f"  frequency        {freq / 1000:.2f} GHz"
+                + (f" [dim]of {fmax / 1000:.2f} GHz base[/]" if fmax else ""),
                 f"  context switches {snap.get('ctx_switches', 0):,}/s",
                 f"  interrupts       {snap.get('interrupts', 0):,}/s",
                 f"  uptime           {duration(time.time() - snap.get('boot', time.time()))}"]
-        try:
-            load = psutil.getloadavg()
-            out.append(f"  load average     {load[0]:.2f}  {load[1]:.2f}  {load[2]:.2f}")
-        except Exception:
-            pass
         procs = snap.get("procs") or []
         out += ["", "[bold]top by CPU[/]"]
         for p in procs[:12]:
-            out.append(f"  {p['cpu']:5.1f}%  [dim]{p['pid']:>7}[/]  {p['name'][:28]:<28}"
+            out.append(f"  {p['cpu']:5.1f}%  [dim]{p['pid']:>7}[/]  {escape(p['name'][:28]):<28}"
                        f"[dim]{human_bytes(p['rss'])}[/]")
+        out += ["", "[dim]Temperature, power and voltage need LibreHardwareMonitor — "
+                "coming in the sensors step.[/]"]
         return "\n".join(out)
 
-    def _detail_memory(self, snap, s) -> str:
+    def _detail_memory(self, snap, s, width) -> str:
         vm, sw = snap.get("mem"), snap.get("swap")
         if not vm:
             return "[dim]sampling…[/]"
-        out = ["[bold]MEMORY[/]", ""]
-        out.append(f"physical  {bar(vm.percent / 100, 30)} [bold]{vm.percent:5.1f}%[/]")
-        out += [
-            f"  total      {human_bytes(vm.total)}",
-            f"  used       {human_bytes(vm.used)}",
-            f"  available  {human_bytes(vm.available)}",
-        ]
-        for field in ("cached", "buffers", "shared"):
-            if hasattr(vm, field):
-                out.append(f"  {field:<10} {human_bytes(getattr(vm, field))}")
+        lvl = level(s.mem.recent(30), 85, 93)
+        out = [f"[{NUM[lvl]}]{vm.percent:.1f}%[/]  [dim]{human_bytes(vm.used)} of "
+               f"{human_bytes(vm.total)} used · {human_bytes(vm.available)} available[/]", ""]
+        out += self._graph(s.mem.points, width, lvl)
+        out += ["", "[bold]breakdown[/]",
+                f"  total      {human_bytes(vm.total)}",
+                f"  used       {human_bytes(vm.used)}",
+                f"  available  {human_bytes(vm.available)}"]
         if sw:
-            out += ["", f"swap      {bar(sw.percent / 100, 30)} [bold]{sw.percent:5.1f}%[/]",
-                    f"  total      {human_bytes(sw.total)}",
-                    f"  used       {human_bytes(sw.used)}"]
-            if getattr(sw, "sin", 0) or getattr(sw, "sout", 0):
-                out.append(f"  paged      in {human_bytes(sw.sin)} / out {human_bytes(sw.sout)}")
-        out += ["", "[dim]2 min: "
-                f"avg {s.mem.mean:.1f}%  peak {s.mem.peak:.1f}%[/]", ""]
-        out.append("[bold]top by memory[/]")
+            out.append(f"  swap       {human_bytes(sw.used)} of {human_bytes(sw.total)} "
+                       f"[dim]({sw.percent:.0f}%)[/]")
+        mods = (snap.get("sysinfo") or {}).get("ram") or []
+        if isinstance(mods, dict):
+            mods = [mods]
+        if mods:
+            running, rated = ram_speed(snap)
+            out += ["", "[bold]modules[/]"]
+            for m in mods:
+                out.append(f"  {escape(m.get('slot') or '?'):<10} {human_bytes(m.get('size') or 0):>8}  "
+                           f"{escape(m.get('maker') or '')} {escape(m.get('part') or '')}  "
+                           f"[dim]{m.get('configured') or m.get('speed')} MT/s[/]")
+            if running and rated and running < rated - 100:
+                out += ["", f"[yellow]Running at {running} MT/s but rated for {rated}.[/] "
+                        "EXPO is probably off. In the BIOS: F7 for Advanced Mode, then "
+                        "Ai Tweaker > Ai Overclock Tuner > EXPO I, then F10 to save.",
+                        "[dim]The first boot after that trains the memory and can sit on a "
+                        "black screen for a few minutes. Let it finish.[/]"]
+            elif rated:
+                out.append(f"  [green]running at its rated {rated} MT/s[/]")
+        out += ["", "[bold]top by memory[/]"]
         for p in sorted(snap.get("procs") or [], key=lambda r: -r["rss"])[:15]:
             frac = p["rss"] / vm.total if vm.total else 0
             out.append(f"  {bar(frac, 12)} {human_bytes(p['rss']):>9}  "
-                       f"[dim]{p['pid']:>7}[/]  {p['name'][:30]}")
+                       f"[dim]{p['pid']:>7}[/]  {escape(p['name'][:30])}")
         return "\n".join(out)
 
-    def _detail_gpu(self, snap, s) -> str:
+    def _detail_gpu(self, snap, s, width) -> str:
         used = snap.get("vram_used") or 0
         total = snap.get("vram_total") or 0
-        out = ["[bold]GPU[/]", ""]
-        out.append(f"load      {bar(s.gpu.now / 100, 30)} [bold]{s.gpu.now:5.1f}%[/]")
-        if total:
-            out.append(f"vram      {bar(used / total, 30)} [bold]{used / total * 100:5.1f}%[/]")
-            out.append(f"  {human_bytes(used)} of {human_bytes(total)}")
-        out.append(f"[dim]2 min: avg {s.gpu.mean:.1f}%  peak {s.gpu.peak:.1f}%[/]")
+        vpct = used / total * 100 if total else 0
+        v_l = level(vpct, 90, 97)
+        out = [f"[bold]{s.gpu.now:.0f}%[/] load   VRAM [{NUM[v_l]}]{vpct:.0f}%[/] "
+               f"[dim]{human_bytes(used)} of {human_bytes(total)} · 5 min avg load "
+               f"{s.gpu.mean:.0f}%[/]", ""]
+        out += self._graph(s.gpu.points, width, label="load")
+        out += ["", "[bold]video memory[/]"] + self._graph(s.vram.points, width, v_l, label="VRAM")
+
+        ol = snap.get("ollama")
+        out += ["", "[bold]Ollama (local models)[/]"]
+        if ol is None:
+            out.append("  [dim]checking…[/]")
+        elif not ol["up"]:
+            out.append("  [dim]not running[/]")
+        elif not ol["models"]:
+            out.append("  [dim]running, no model loaded — nothing held in video memory[/]")
+        else:
+            for m in ol["models"]:
+                until = (f"unloads at {datetime.fromtimestamp(m['until']):%H:%M}"
+                         if m["until"] else "stays loaded")
+                share = f" · {m['vram'] / total * 100:.0f}% of VRAM" if total else ""
+                out.append(f"  [bold]{escape(m['name'])}[/]  {human_bytes(m['vram'])}{share}  "
+                           f"[dim]{m['params']} · {m['context']:,} context · {until}[/]")
+            out.append("  [dim]Ollama frees the memory itself when the model unloads. "
+                       "`ollama stop <model>` frees it now.[/]")
+
         types = snap.get("gpu_types") or {}
         if types:
-            out += ["", "[bold]by engine[/]",
-                    "[dim]3D is rendering and most compute; copy is data moving "
-                    "to and from the card; videodecode/encode are the media blocks.[/]"]
+            out += ["", "[bold]by engine[/]  [dim]3D is rendering and most compute; copy "
+                    "moves data to and from the card; video is the media blocks[/]"]
             for name, value in sorted(types.items(), key=lambda kv: -float(kv[1] or 0)):
                 v = min(100.0, float(value or 0))
-                out.append(f"  {name[:20]:<20} {bar(v / 100, 22)} {v:5.1f}%")
-        else:
-            out += ["", "[dim]No engine breakdown yet — the counter stream takes "
-                    "a second to start.[/]"]
-        out += ["", "[dim]Read from Windows GPU performance counters. This box has "
-                "an AMD card, so there is no nvidia-smi and therefore no "
-                "temperature, fan or power draw available here.[/]"]
+                out.append(f"  {escape(name[:20]):<20} {bar(v / 100, 22)} {v:5.1f}%")
+        gpus = (snap.get("sysinfo") or {}).get("gpus") or []
+        if isinstance(gpus, dict):
+            gpus = [gpus]
+        for g in gpus:
+            out += ["", f"[dim]{escape(g.get('name') or '')} · driver {g.get('driver')} "
+                    f"({g.get('date')})[/]"]
+        out += ["[dim]Temperature, fan speed and power need LibreHardwareMonitor — "
+                "coming in the sensors step.[/]"]
         return "\n".join(out)
 
-    def _detail_storage(self, snap, s) -> str:
-        out = ["[bold]STORAGE[/]", ""]
+    def _detail_storage(self, snap, s, width) -> str:
+        out = [f"read [bold]{rate(s.disk_read.now)}[/]   write [bold]{rate(s.disk_write.now)}[/]"
+               f"  [dim]peaks {rate(s.disk_read.peak)} / {rate(s.disk_write.peak)}[/]", ""]
+        top = max(s.disk_read.peak + s.disk_write.peak, 1024 ** 2)
+        out += self._graph([r + w for r, w in zip(s.disk_read.points, s.disk_write.points)],
+                           width, top=top, label="read + write")
+        out.append("")
         for d in snap.get("disks") or []:
+            dl = disk_level(d)
             out += [f"[bold]{d['device']}[/] [dim]{d['fstype']}[/]",
-                    f"  {bar(d['percent'] / 100, 30)} {d['percent']:5.1f}%",
-                    f"  {human_bytes(d['used'])} used · {human_bytes(d['free'])} free "
-                    f"· {human_bytes(d['total'])} total", ""]
-        out += ["[bold]throughput (all volumes)[/]",
-                f"  read   {rate(s.disk_read.now):>12}  [dim]peak {rate(s.disk_read.peak)}[/]",
-                f"  write  {rate(s.disk_write.now):>12}  [dim]peak {rate(s.disk_write.peak)}[/]",
-                ""]
+                    f"  {bar(d['percent'] / 100, 30, dl)} [{NUM[dl]}]{human_bytes(d['free'])} free[/]"
+                    f"  [dim]{human_bytes(d['used'])} used of {human_bytes(d['total'])}[/]", ""]
         per = snap.get("per_disk") or {}
         if per:
             out.append("[bold]lifetime per device[/]")
             for name, v in sorted(per.items(), key=lambda kv: -(kv[1]["read"] + kv[1]["write"]))[:8]:
-                out.append(f"  {name[:22]:<22} read {human_bytes(v['read']):>9}  "
+                out.append(f"  {escape(name[:22]):<22} read {human_bytes(v['read']):>9}  "
                            f"write {human_bytes(v['write']):>9}  "
                            f"[dim]{v['rcount'] + v['wcount']:,} ops[/]")
         out += ["", "[dim]disk-sentinel.py answers the other storage question — "
                 "what is actually eating the space.[/]"]
         return "\n".join(out)
 
-    def _detail_network(self, snap, s) -> str:
-        out = ["[bold]NETWORK[/]", "",
-               f"  down   [bold]{rate(s.net_down.now):>12}[/]  "
-               f"[dim]peak {rate(s.net_down.peak)}  avg {rate(s.net_down.mean)}[/]",
-               f"  up     [bold]{rate(s.net_up.now):>12}[/]  "
-               f"[dim]peak {rate(s.net_up.peak)}  avg {rate(s.net_up.mean)}[/]", ""]
-        out.append("[bold]interfaces[/]")
+    def _detail_network(self, snap, s, width) -> str:
+        top = max(s.net_down.peak, s.net_up.peak, 64 * 1024)
+        out = [f"↓ [bold]{rate(s.net_down.now)}[/]   ↑ [bold]{rate(s.net_up.now)}[/]  "
+               f"[dim]peaks ↓ {rate(s.net_down.peak)} ↑ {rate(s.net_up.peak)}[/]", ""]
+        out += self._graph(s.net_down.points, width, top=top, label="download")
+        out += [""] + self._graph(s.net_up.points, width, top=top, label="upload")
+        ts = snap.get("tailscale")
+        if ts is not None:
+            out += ["", "Tailscale " + ("[green]connected[/]" if ts else "[yellow]not connected[/]")]
+        out += ["", "[bold]interfaces[/]"]
         for n in snap.get("nets") or []:
             speed = f"{n['speed']} Mb/s link" if n["speed"] else "speed unknown"
-            out += [f"  [bold]{n['name'][:34]}[/] [dim]{speed}[/]",
+            out += [f"  [bold]{escape(n['name'][:34])}[/] [dim]{speed}[/]",
                     f"    received {human_bytes(n['recv']):>10}  "
                     f"[dim]{n['pkt_recv']:,} packets[/]",
                     f"    sent     {human_bytes(n['sent']):>10}  "
@@ -892,18 +1594,28 @@ class Belt(App):
             out += ["", "[dim]socket counts need elevation[/]"]
         return "\n".join(out)
 
-    def _detail_claude(self, snap, s) -> str:
+    def _detail_claude(self, snap, s, width) -> str:
         c = snap["claude"]
-        out = ["[bold]CLAUDE[/]", "",
-               f"  today        [bold]{c['today_calls']:,}[/] calls  "
-               f"[dim]~${c['today_cost']:,.2f}[/]",
-               f"  all time     {len(c['sessions'])} sessions  "
-               f"[dim]${sum(x['cost'] for x in c['sessions']):,.2f}[/]", ""]
+        out = [f"[bold]${c['today_cost']:,.2f}[/] today  [dim]{c['today_calls']:,} calls · "
+               f"{len(c['sessions'])} chats · ${sum(x['cost'] for x in c['sessions']):,.2f} "
+               f"all time[/]", ""]
+        order = {"approval": 0, "waiting": 1, "working": 2, "idle": 3}
+        active = sorted((x for x in c["sessions"] if x["state"] in order),
+                        key=lambda x: (order[x["state"]], x["age"]))
+        out.append("[bold]chats in the last 12 hours[/]")
+        if not active:
+            out.append("  [dim]none[/]")
+        for x in active:
+            colour = {"approval": "yellow", "waiting": "bold", "working": "green", "idle": "dim"}[x["state"]]
+            out.append(f"  [{colour}]{STATE_LABEL[x['state']]:<18}[/] {escape(x['title'][:50]):<50} "
+                       f"[dim]{duration(x['age'])} ago[/]")
+        out += ["[dim]  'may need approval' means the chat stopped on a tool call and has been "
+                "quiet since — usually a permission prompt, sometimes a long command.[/]", ""]
         models = c.get("models") or {}
         if models:
             out.append("[bold]by model[/]  [dim]input · cache write · cache read · output[/]")
             for name, v in sorted(models.items(), key=lambda kv: -cost_of(kv[0], kv[1])):
-                out.append(f"  {name[:26]:<26} {v[0] / 1e6:7.1f}M {v[1] / 1e6:7.1f}M "
+                out.append(f"  {escape(name[:26]):<26} {v[0] / 1e6:7.1f}M {v[1] / 1e6:7.1f}M "
                            f"{v[2] / 1e6:9.1f}M {v[3] / 1e6:7.1f}M   "
                            f"[bold]${cost_of(name, v):,.2f}[/]")
             cr = sum(v[2] for v in models.values())
@@ -912,59 +1624,133 @@ class Belt(App):
                 out += ["", f"[dim]{cr / (cr + out_tok) * 100:.1f}% of all tokens are "
                         f"cache reads — the conversation being re-read each turn, "
                         f"not new work.[/]"]
-        out += ["", "[bold]most expensive sessions[/]"]
+        out += ["", "[bold]most expensive chats[/]"]
         for sess in c["sessions"][:12]:
-            out.append(f"  [bold]${sess['cost']:>8,.2f}[/]  [dim]{sess['id']:<10}[/] "
-                       f"{sess['calls']:>5} calls  {sess['title'][:44]}")
+            out.append(f"  [bold]${sess['cost']:>8,.2f}[/]  {sess['calls']:>5} calls  "
+                       f"{escape(sess['title'][:50])}")
         out += ["", "[dim]Costs are API list rates applied to the transcript logs. "
                 "Your plan is billed differently — /usage is authoritative.[/]"]
         return "\n".join(out)
 
-    def _detail_agents(self, snap, s) -> str:
+    def _detail_agents(self, snap, s, width) -> str:
         agents = snap.get("agents") or []
-        out = ["[bold]AGENTS[/]  [dim]subagent transcripts under "
-               "~/.claude/projects[/]", ""]
         if not agents:
-            return "\n".join(out + ["[dim]No agent transcripts found.[/]"])
+            return "[dim]No agent transcripts found.[/]"
         live = [a for a in agents if a["live"]]
-        out.append(f"  [bold]{len(live)}[/] working now  [dim]· {len(agents)} seen "
-                   f"in total · 'working' means the log was written to within "
-                   f"{AGENT_LIVE_SECONDS}s[/]")
-        out.append("")
+        out = [f"[bold]{len(live)}[/] working now  [dim]· {len(agents)} seen in total · "
+               f"'working' means the log was written to within {AGENT_LIVE_SECONDS}s[/]", ""]
         for a in agents[:20]:
             dot = "[green]●[/]" if a["live"] else "[dim]○[/]"
             tool = a["last_tool"] or "—"
-            wf = f" [dim]{a['workflow'][:14]}[/]" if a["workflow"] else ""
+            wf = f" [dim]{escape(a['workflow'][:14])}[/]" if a["workflow"] else ""
             out += [f"{dot} [bold]{a['id']}[/]{wf}  [dim]{duration(a['age'])} since "
                     f"last write[/]",
-                    f"    last tool [bold]{tool}[/]  ·  {a['calls']} calls  ·  "
+                    f"    last tool [bold]{escape(tool)}[/]  ·  {a['calls']} calls  ·  "
                     f"[dim]${a['cost']:,.2f}[/]",
-                    f"    [dim]{a['title'][:76]}[/]"]
+                    f"    [dim]{escape(a['title'][:76])}[/]"]
         return "\n".join(out)
 
-    def _detail_processes(self, snap, s) -> str:
+    def _detail_processes(self, snap, s, width) -> str:
         procs = snap.get("procs") or []
         vm = snap.get("mem")
-        out = [f"[bold]PROCESSES[/]  [dim]{len(procs)} running[/]", ""]
+        out = [f"[bold]{len(procs)}[/] processes running", ""]
+        hp = snap.get("helpers") or {}
+        left = snap.get("leftovers") or []
+        out.append("[bold]Claude Code helpers[/]")
+        if hp.get("sessions"):
+            out.append(f"  {hp['sessions']} chats are loaded in the Claude app. Each runs its "
+                       f"own MCP servers: {hp['count']} processes using "
+                       f"{human_bytes(hp['rss'])} in total.")
+            out.append("  [dim]Expected, not a leak. Archiving chats you no longer need "
+                       "closes theirs.[/]")
+        else:
+            out.append("  [dim]no Claude Code chats loaded[/]")
+        out += ["", "[bold]leftover processes[/]  [dim]script processes whose parent has closed[/]"]
+        if not left:
+            out.append("  [green]none[/]")
+        for p in left:
+            out.append(f"  [yellow]{p['pid']:>7}[/]  {escape(p['name']):<16} "
+                       f"{human_bytes(p['rss']):>9}  [dim]{duration(p['age'])} old[/]  "
+                       f"{escape(p['what'])}")
+        if left:
+            out.append("  [dim]End them in Task Manager (Details tab, by PID) if you do not "
+                       "recognise them. UtilityBelt never kills anything itself.[/]")
         groups: dict = defaultdict(lambda: [0, 0.0, 0])
         for p in procs:
             g = groups[p["name"]]
             g[0] += 1
             g[1] += p["cpu"]
             g[2] += p["rss"]
-        out.append("[bold]by program[/]  [dim]instances · cpu · memory[/]")
+        out += ["", "[bold]by program[/]  [dim]instances · cpu · memory[/]"]
         for name, (count, cpu, rss) in sorted(groups.items(), key=lambda kv: -kv[1][2])[:14]:
-            out.append(f"  {name[:26]:<26} [dim]{count:>3}×[/]  {cpu:5.1f}%  "
+            out.append(f"  {escape(name[:26]):<26} [dim]{count:>3}×[/]  {cpu:5.1f}%  "
                        f"{human_bytes(rss):>9}")
         out += ["", "[bold]top single processes by CPU[/]"]
         for p in procs[:14]:
-            out.append(f"  {p['cpu']:5.1f}%  [dim]{p['pid']:>7}[/]  {p['name'][:30]:<30}"
+            out.append(f"  {p['cpu']:5.1f}%  [dim]{p['pid']:>7}[/]  {escape(p['name'][:30]):<30}"
                        f"{human_bytes(p['rss']):>9}  [dim]{p['threads']} threads[/]")
         if vm:
             out += ["", "[bold]top single processes by memory[/]"]
             for p in sorted(procs, key=lambda r: -r["rss"])[:14]:
                 out.append(f"  {human_bytes(p['rss']):>9}  [dim]{p['pid']:>7}[/]  "
-                           f"{p['name'][:30]:<30}{p['cpu']:5.1f}%")
+                           f"{escape(p['name'][:30]):<30}{p['cpu']:5.1f}%")
+        return "\n".join(out)
+
+    def _detail_health(self, snap, s, width) -> str:
+        alerts = compute_alerts(snap, s)
+        out = ["[bold]needs attention[/]"]
+        if not alerts:
+            out.append("  [green]✓ nothing — all readings are normal[/]")
+        for a in alerts:
+            mark = "[red]●[/]" if a["lvl"] == CRIT else "[yellow]⚠[/]"
+            out.append(f"  {mark} {escape(a['long'])}")
+
+        evs = snap.get("events")
+        out += ["", f"[bold]event log, last {EVENT_DAYS} days[/]  [dim]hardware errors, "
+                "blue screens, driver resets, unexpected restarts and app crashes[/]"]
+        if evs is None:
+            out.append("  [dim]reading…[/]")
+        else:
+            counts = Counter(e["kind"] for e in evs)
+            for kind in ("hardware error", "blue screen", "GPU driver crashed and recovered",
+                         "unexpected shutdown or restart", "app crash"):
+                n = counts.get(kind, 0)
+                sev = next((e["sev"] for e in evs if e["kind"] == kind), OK)
+                colour = "green" if not n else FILL[sev] if sev != OK else "default"
+                out.append(f"  [{colour}]{n:>3}[/]  {kind}")
+            serious = [e for e in evs if e["kind"] != "app crash"]
+            if serious:
+                out += ["", "  [bold]most recent[/]"]
+                for e in serious[:8]:
+                    out.append(f"  [dim]{datetime.fromtimestamp(e['when']):%a %d %b %H:%M}[/]  "
+                               f"{e['kind']}")
+            crashes = Counter(e["detail"] for e in evs if e["kind"] == "app crash")
+            if crashes:
+                out += ["", "  [bold]apps that crashed[/]"]
+                for app, n in crashes.most_common(6):
+                    out.append(f"  {n:>3}×  {escape(app)}")
+            if not counts.get("hardware error"):
+                out += ["", "  [dim]No hardware (WHEA) errors. After changing RAM or BIOS "
+                        "settings this is the first place instability shows up.[/]"]
+
+        info = snap.get("sysinfo") or {}
+        out += ["", "[bold]this machine[/]"]
+        if info:
+            bios = info.get("bios") or {}
+            running, rated = ram_speed(snap)
+            gpus = info.get("gpus") or []
+            if isinstance(gpus, dict):
+                gpus = [gpus]
+            rows = [("board", info.get("board")),
+                    ("BIOS", f"{bios.get('version', '?')} ({bios.get('date', '?')})"),
+                    ("processor", info.get("cpu")),
+                    ("RAM", f"{running} MT/s" + (f" of {rated} rated" if rated else ""))]
+            rows += [("graphics", f"{g.get('name')} · driver {g.get('driver')} ({g.get('date')})")
+                     for g in gpus]
+            for label, value in rows:
+                out.append(f"  {label:<10} {escape(str(value or '?'))}")
+        else:
+            out.append("  [dim]reading…[/]")
         return "\n".join(out)
 
 
@@ -979,7 +1765,8 @@ def probe() -> int:
     while time.time() < deadline:
         time.sleep(1.0)
         snap = sampler.read()
-        if snap.get("procs") and snap.get("disks") and snap["claude"]["scanned"]:
+        if (snap.get("procs") and snap.get("disks") and snap["claude"]["scanned"]
+                and snap.get("sysinfo") is not None and snap.get("events") is not None):
             break
         print(f"\r[waiting] procs={len(snap.get('procs') or [])} "
               f"disks={len(snap.get('disks') or [])} "
@@ -990,19 +1777,32 @@ def probe() -> int:
     vm = snap.get("mem")
     if vm:
         print(f"memory       {vm.percent:.1f}%  {human_bytes(vm.used)} / {human_bytes(vm.total)}")
+    running, rated = ram_speed(snap)
+    print(f"ram speed    {running} MT/s, rated {rated or '?'}")
     print(f"gpu          {sampler.gpu.now:.1f}%  engines={list((snap.get('gpu_types') or {}).keys())}")
     print(f"vram         {human_bytes(snap.get('vram_used') or 0)} / "
           f"{human_bytes(snap.get('vram_total') or 0)}")
-    print(f"disks        {[d['device'] for d in snap.get('disks') or []]}")
+    ol = snap.get("ollama") or {}
+    print(f"ollama       up={ol.get('up')}  "
+          f"{[(m['name'], human_bytes(m['vram'])) for m in ol.get('models') or []]}")
+    print(f"disks        {[(d['device'], human_bytes(d['free'])) for d in snap.get('disks') or []]}")
     print(f"disk io      r {rate(sampler.disk_read.now)}  w {rate(sampler.disk_write.now)}")
-    print(f"net          down {rate(sampler.net_down.now)}  up {rate(sampler.net_up.now)}")
-    print(f"nics         {[n['name'] for n in snap.get('nets') or []][:4]}")
+    print(f"net          down {rate(sampler.net_down.now)}  up {rate(sampler.net_up.now)}  "
+          f"tailscale={snap.get('tailscale')}")
     print(f"processes    {len(snap.get('procs') or [])}")
+    hp = snap.get("helpers") or {}
+    print(f"helpers      {hp.get('sessions')} chats, {hp.get('count')} procs, "
+          f"{human_bytes(hp.get('rss') or 0)}")
+    print(f"leftovers    {[(p['pid'], p['what']) for p in snap.get('leftovers') or []]}")
+    evs = snap.get("events") or []
+    print(f"events       {dict(Counter(e['kind'] for e in evs))}")
     c = snap["claude"]
     print(f"claude       {c['today_calls']} calls today, ${c['today_cost']:.2f}, "
-          f"{len(c['sessions'])} sessions")
+          f"{len(c['sessions'])} sessions, "
+          f"states={dict(Counter(x['state'] for x in c['sessions']))}")
     print(f"agents       {len(snap.get('agents') or [])} "
           f"({sum(1 for a in snap.get('agents') or [] if a['live'])} live)")
+    print("alerts       " + " | ".join(a["short"] for a in compute_alerts(snap, sampler)))
     if snap.get("errors"):
         print("errors      ", snap["errors"])
     sampler.stop.set()
@@ -1010,14 +1810,17 @@ def probe() -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--probe", action="store_true",
                     help="print one sample of every metric and exit")
+    ap.add_argument("--mini", action="store_true",
+                    help="start as the small strip (m switches back)")
     args = ap.parse_args()
     if args.probe:
         return probe()
     sampler = Sampler()
-    app = Belt(sampler)
+    app = Belt(sampler, mini=args.mini)
     try:
         app.run()
     finally:

@@ -14,22 +14,40 @@ this folder by absolute path; see **Wiring** below before moving it again.
 
 ```
 belt.cmd                 # or: python belt.py
+belt-mini.cmd            # the mini strip, in the top-right corner of the screen
+python belt.py --mini    # the mini strip in the current window
 python belt.py --probe   # one sample of every metric, no UI
 ```
 
-Eight panels, each clickable (or press its number) for a detail view. Escape
-goes back, `q` quits. Repaints once a second.
+Three levels of detail:
+
+- **Mini** — three lines: headline numbers with small graphs, network and
+  Claude status, then whatever needs attention. Used automatically when the
+  window is under 90 columns or 16 rows; `m` toggles it at any size.
+- **Standard** — eight cards, each leading with one number and a 5-minute
+  graph that fills the card's spare height. A top bar lists what needs
+  attention (click it, or press `h`, for the health view).
+- **Detail** — click a card or press its number. Escape goes back, `q` quits.
+
+Colour means severity only: grey is normal, yellow worth a look, red needs
+action. Graphs stay grey; the number and the card border carry the colour.
+Lines never wrap — they end in an ellipsis.
 
 | Panel | Detail view shows |
 | --- | --- |
-| CPU | every thread individually, frequency, context switches and interrupts per second, load average, uptime, top processes |
-| Memory | physical breakdown, swap and paging, top processes by resident size |
-| GPU | load, VRAM, and a per-engine split (3D, copy, video) |
-| Storage | per-volume capacity, live read/write rates, lifetime bytes and op counts per device |
-| Network | per-interface totals, packets, errors, drops, link speed, socket counts |
-| Claude | per-model token and cost table, most expensive sessions |
+| CPU | 5-minute graph, every thread, frequency, context switches and interrupts per second, uptime, top processes |
+| Memory | 5-minute graph, breakdown, each RAM module with its running speed against the rated speed in its part number (catches EXPO being off), top processes |
+| GPU | load and VRAM graphs, what Ollama has loaded and when it unloads, per-engine split, driver version |
+| Storage | read/write graph, per-volume capacity, lifetime bytes and op counts per device |
+| Network | download and upload graphs, Tailscale, per-interface totals, errors, sockets |
+| Claude | which chats are working, waiting on you, or probably stuck on a permission prompt; per-model token and cost table |
 | Agents | every subagent transcript: last tool used, workflow, calls, cost, age |
-| Processes | grouped by program, then top processes by CPU and by memory |
+| Processes | Claude Code helpers (each loaded chat's MCP servers), leftover script processes whose parent has closed, then top processes |
+| Health (`h`) | everything flagged, the Windows event log for 7 days (hardware/WHEA errors, blue screens, GPU driver resets, unexpected restarts, app crashes), board, BIOS, CPU, RAM and driver versions |
+
+Chat state is read from how each transcript ends: a finished reply means
+waiting on you; a tool call followed by silence usually means a permission
+prompt. Nothing here is authoritative about billing — costs are API list rates.
 
 Metric selection follows what btop and glances treat as the useful set: per-core
 rather than an average, memory split by available and cached, I/O rates
@@ -41,7 +59,11 @@ alongside capacity, and per-process attribution.
 frame, so one PowerShell process is started at launch and streams a JSON line
 per second that a reader thread consumes. The upside is the per-engine
 breakdown; the cost is that temperature, fan speed and power draw are not
-available — those need vendor tooling that does not exist here.
+available from Windows. LibreHardwareMonitor can supply them (planned).
+
+Slower facts come from a fourth thread: Ollama's `/api/ps` every 5 s, the
+event log every 5 minutes (about 0.3 s, no admin needed), and RAM, board, BIOS
+and driver details once at start.
 
 ### `dash.py` — the same picture as one static frame
 
