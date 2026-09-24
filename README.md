@@ -89,17 +89,32 @@ changes.
 | `startup-audit.ps1` | Everything that launches itself at sign-in. |
 | `statusline.ps1` | Claude Code status line — live context and cost. |
 | `SOUNDS.md` | Notes on the sound design. |
+| `requirements.txt` | Python packages for `belt.py`. |
+| `NVIDIA-SETUP.md` | Setup steps and a ready-to-paste Claude Code prompt that adds NVIDIA temperature, fan, power and clock readings. |
 
 ## Setup
 
+Needs Windows 10 or 11, Python 3.10 or newer, Windows PowerShell (built in),
+and Windows Terminal for `belt-mini.cmd`.
+
 ```
-pip install textual psutil
+git clone https://github.com/Laumerz84/utilitybelt.git
+cd utilitybelt
+pip install -r requirements.txt
+python belt.py --probe     # checks every reading; should list your CPU, RAM, GPU, disks
+belt.cmd                   # the dashboard
 ```
 
-Only `belt.py` needs them. Everything else is standard library.
+Only `belt.py` needs the packages. Everything else is standard library.
+Ollama and Tailscale are optional: their panels say "not running" without them.
+
+**NVIDIA card?** GPU load and VRAM work as-is, but this was built on an AMD
+card. `NVIDIA-SETUP.md` has a prompt to give Claude Code that adds NVIDIA's
+temperature, fan, power and clock readings.
 
 ## Wiring
 
+Optional — only if you want the notification sounds and status line.
 `~/.claude/settings.json` calls into this folder by absolute path — seven
 notification hooks pointing at `notify.py`, and one status line pointing at
 `statusline.ps1`. **Moving or renaming this directory breaks all eight

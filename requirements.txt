@@ -1,0 +1,13 @@
+# UtilityBelt - Python packages. Only belt.py needs these; every other script
+# is standard library. Windows 10/11 and Python 3.10+ (tested on 3.14).
+#
+#   pip install -r requirements.txt
+#
+# Versions are the ones belt.py was tested with. Textual below 8 lacks the
+# text-wrap / text-overflow styles the cards rely on.
+textual>=8.2,<9
+rich>=14          # installed with textual; listed because belt.py imports it directly
+psutil>=7.0
+
+# NVIDIA cards only - see NVIDIA-SETUP.md. Not needed on AMD.
+# nvidia-ml-py>=13
