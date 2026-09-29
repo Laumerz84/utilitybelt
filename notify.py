@@ -28,6 +28,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 STAMP = HERE / ".turn-start"
 SETTINGS = HERE / "sounds.json"      # edited with `python sounds.py`; shared through git
+LOCAL = HERE / "sounds.local.json"   # this computer only (volume); not in git
 
 # Turns shorter than this stay silent - you were still watching the screen.
 QUIET_UNDER_S = 12.0
@@ -37,23 +38,46 @@ QUIET_UNDER_S = 12.0
 DEFAULTS = {
     "quiet_under_seconds": QUIET_UNDER_S,
     "mute_when_claude_focused": True,
+    "volume": 1.0,                   # 1 = as made; 2 = twice as loud (each sound stops at its clean maximum)
     "events": {"Stop": "done", "Notification": "attention", "PostToolUseFailure": "error",
                "PermissionDenied": "denied", "SubagentStop": "subagent", "PreCompact": "compact"},
 }
 
 
 def settings() -> dict:
-    """DEFAULTS overlaid with sounds.json; a bad or missing file changes nothing."""
+    """DEFAULTS overlaid with sounds.json, then sounds.local.json; a bad or missing file changes nothing."""
     cfg = json.loads(json.dumps(DEFAULTS))
-    try:
-        user = json.loads(SETTINGS.read_text(encoding="utf-8"))
-        cfg["events"].update({k: v for k, v in (user.get("events") or {}).items() if isinstance(v, str)})
-        for key in ("quiet_under_seconds", "mute_when_claude_focused"):
-            if key in user:
-                cfg[key] = user[key]
-    except (OSError, ValueError, AttributeError, TypeError):
-        pass
+    for f in (SETTINGS, LOCAL):
+        try:
+            user = json.loads(f.read_text(encoding="utf-8"))
+            cfg["events"].update({k: v for k, v in (user.get("events") or {}).items() if isinstance(v, str)})
+            for key in ("quiet_under_seconds", "mute_when_claude_focused", "volume"):
+                if key in user:
+                    cfg[key] = user[key]
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
     return cfg
+
+
+def louder(path: Path, volume: float) -> bytes | None:
+    """The 16-bit .wav scaled by volume, never past full scale, as WAV bytes; None = play the file as is."""
+    import array
+    import io
+    import wave
+    try:
+        with wave.open(str(path)) as w:
+            params, frames = w.getparams(), w.readframes(w.getnframes())
+        if params.sampwidth != 2 or sys.byteorder != "little":
+            return None
+        a = array.array("h", frames)
+        gain = min(float(volume), 32767 / max(1, max(abs(x) for x in a)))
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as out:
+            out.setparams(params)
+            out.writeframes(array.array("h", (int(x * gain) for x in a)).tobytes())
+        return buf.getvalue()
+    except Exception:
+        return None
 
 # Tools whose failure is routine and not worth a sound.
 BORING_FAILURES = {"Read", "Glob", "Grep", "TodoWrite"}
@@ -127,18 +151,22 @@ def decide(event: str, data: dict, cfg: dict | None = None) -> str | None:
     return sound
 
 
-def play(name: str) -> None:
+def play(name: str, volume: float = 1.0) -> None:
     path = HERE / f"{name}.wav"
     if not path.exists():
         return
     if sys.platform == "win32":
         import winsound
+        data = louder(path, volume) if volume != 1.0 else None
         # Blocking on purpose: the process exiting would cut an async sound
         # short. The hook itself is marked async, so Claude is not waiting.
-        winsound.PlaySound(str(path), winsound.SND_FILENAME)
+        if data:
+            winsound.PlaySound(data, winsound.SND_MEMORY)
+        else:
+            winsound.PlaySound(str(path), winsound.SND_FILENAME)
     else:
         import subprocess
-        for player in (["afplay", str(path)], ["aplay", "-q", str(path)]):
+        for player in (["afplay", "-v", str(volume), str(path)], ["aplay", "-q", str(path)]):
             try:
                 subprocess.run(player, timeout=10, check=True,
                                capture_output=True)
@@ -168,7 +196,7 @@ def main() -> int:
         muted = MUTE_WHEN_FOCUSED if cfg.get("mute_when_claude_focused", True) else set()
         if sound not in ALWAYS_PLAY and foreground_exe() in muted:
             return 0
-        play(sound)
+        play(sound, float(cfg.get("volume", 1.0)))
     except Exception:
         pass          # a crashing hook is worse than a silent one
     return 0

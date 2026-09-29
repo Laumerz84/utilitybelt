@@ -40,15 +40,24 @@ def menu() -> None:
             print(f" {i}. {EVENTS[ev]:<24} {cfg['events'].get(ev) or 'off'}")
         print(f" 7. quiet for turns shorter than   {cfg['quiet_under_seconds']:g} s")
         print(f" 8. silent while Claude is in front {'yes' if cfg['mute_when_claude_focused'] else 'no'}")
+        print(f" 9. volume on this computer        {cfg['volume']:g}  (1 = as made, up to 4)")
         c = input("\n number to change, p<number> to hear one, s to save, q to quit: ").strip().lower()
         if c == "q":
             return
         if c == "s":
-            notify.SETTINGS.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
-            print(f" saved {notify.SETTINGS.name}: commit and push it to share")
+            shared = {k: v for k, v in cfg.items() if k != "volume"}
+            notify.SETTINGS.write_text(json.dumps(shared, indent=2) + "\n", encoding="utf-8")
+            notify.LOCAL.write_text(json.dumps({"volume": cfg["volume"]}, indent=2) + "\n", encoding="utf-8")
+            print(f" saved: {notify.SETTINGS.name} (commit and push it to share) and this computer's volume")
         elif c.startswith("p") and c[1:].isdigit() and 1 <= int(c[1:]) <= len(rows):
             snd = cfg["events"].get(rows[int(c[1:]) - 1])
-            print(" (off)") if snd in (None, "", "off") else notify.play(snd)
+            print(" (off)") if snd in (None, "", "off") else notify.play(snd, float(cfg["volume"]))
+        elif c == "9":
+            got = input("   volume (0.2 to 4): ").strip()
+            try:
+                cfg["volume"] = min(4.0, max(0.2, float(got)))
+            except ValueError:
+                pass
         elif c.isdigit() and 1 <= int(c) <= len(rows):
             ev = rows[int(c) - 1]
             cfg["events"][ev] = pick(names, cfg["events"].get(ev) or "off")
