@@ -130,3 +130,12 @@ The `.wav` files are committed so a fresh clone works without running
 Every cost shown by `belt.py`, `dash.py` and `token-report.py` is API list
 rates applied to the local transcript logs. Plan billing works differently —
 `/usage` is authoritative.
+
+## Sounds: settings and another computer
+
+- Change the sounds: `python sounds.py`. Pick which sound each Claude Code event plays (or off), the quiet-turn
+  length, and whether to stay silent while Claude is in front. `s` saves `sounds.json`.
+- Share them: commit and push `sounds.json`; on the other computer, pull.
+- Set up another computer (Windows, Python on PATH): clone this repo, then run `python sounds.py --install` in it.
+  It points that computer's Claude Code hooks at this folder's `notify.py`, backs up `~/.claude/settings.json`
+  first and keeps any other hooks. Restart Claude Code afterwards.

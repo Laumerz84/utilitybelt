@@ -1,0 +1,12 @@
+{
+  "quiet_under_seconds": 12,
+  "mute_when_claude_focused": true,
+  "events": {
+    "Stop": "done",
+    "Notification": "attention",
+    "PostToolUseFailure": "error",
+    "PermissionDenied": "denied",
+    "SubagentStop": "subagent",
+    "PreCompact": "compact"
+  }
+}

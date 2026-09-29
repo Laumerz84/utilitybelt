@@ -27,9 +27,33 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 STAMP = HERE / ".turn-start"
+SETTINGS = HERE / "sounds.json"      # edited with `python sounds.py`; shared through git
 
 # Turns shorter than this stay silent - you were still watching the screen.
 QUIET_UNDER_S = 12.0
+
+# What plays when sounds.json is missing or unreadable. Each event names a .wav in
+# this folder, or "off".
+DEFAULTS = {
+    "quiet_under_seconds": QUIET_UNDER_S,
+    "mute_when_claude_focused": True,
+    "events": {"Stop": "done", "Notification": "attention", "PostToolUseFailure": "error",
+               "PermissionDenied": "denied", "SubagentStop": "subagent", "PreCompact": "compact"},
+}
+
+
+def settings() -> dict:
+    """DEFAULTS overlaid with sounds.json; a bad or missing file changes nothing."""
+    cfg = json.loads(json.dumps(DEFAULTS))
+    try:
+        user = json.loads(SETTINGS.read_text(encoding="utf-8"))
+        cfg["events"].update({k: v for k, v in (user.get("events") or {}).items() if isinstance(v, str)})
+        for key in ("quiet_under_seconds", "mute_when_claude_focused"):
+            if key in user:
+                cfg[key] = user[key]
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return cfg
 
 # Tools whose failure is routine and not worth a sound.
 BORING_FAILURES = {"Read", "Glob", "Grep", "TodoWrite"}
@@ -75,8 +99,12 @@ def foreground_exe() -> str:
         return ""
 
 
-def decide(event: str, data: dict) -> str | None:
-    """-> sound name, or None for silence."""
+def decide(event: str, data: dict, cfg: dict | None = None) -> str | None:
+    """-> sound name, or None for silence. cfg is settings() (DEFAULTS when None)."""
+    cfg = cfg or DEFAULTS
+    quiet = float(cfg.get("quiet_under_seconds", QUIET_UNDER_S))
+    sound = cfg["events"].get("PreCompact" if event == "PostCompact" else event)
+    sound = None if not sound or sound == "off" else sound
 
     if event == "UserPromptSubmit":
         try:
@@ -89,26 +117,14 @@ def decide(event: str, data: dict) -> str | None:
         try:
             elapsed = time.time() - float(STAMP.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            elapsed = QUIET_UNDER_S + 1      # unknown: assume worth hearing
-        return None if elapsed < QUIET_UNDER_S else "done"
-
-    if event == "Notification":
-        return "attention"
-
-    if event == "PermissionDenied":
-        return "denied"
+            elapsed = quiet + 1              # unknown: assume worth hearing
+        return None if elapsed < quiet else sound
 
     if event == "PostToolUseFailure":
         # A failed Read while exploring is not news; a failed Bash or Edit is.
-        return None if data.get("tool_name") in BORING_FAILURES else "error"
+        return None if data.get("tool_name") in BORING_FAILURES else sound
 
-    if event == "SubagentStop":
-        return "subagent"
-
-    if event in ("PreCompact", "PostCompact"):
-        return "compact"
-
-    return None
+    return sound
 
 
 def play(name: str) -> None:
@@ -143,12 +159,14 @@ def main() -> int:
         data = {}
 
     try:
-        sound = decide(event, data if isinstance(data, dict) else {})
+        cfg = settings()
+        sound = decide(event, data if isinstance(data, dict) else {}, cfg)
         if not sound:
             return 0
         # Suppression is separate from the decision so decide() stays pure
         # and testable, and so the timestamp side effects still happen.
-        if sound not in ALWAYS_PLAY and foreground_exe() in MUTE_WHEN_FOCUSED:
+        muted = MUTE_WHEN_FOCUSED if cfg.get("mute_when_claude_focused", True) else set()
+        if sound not in ALWAYS_PLAY and foreground_exe() in muted:
             return 0
         play(sound)
     except Exception:
