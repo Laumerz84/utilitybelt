@@ -67,7 +67,9 @@ def install(path: Path = Path.home() / ".claude" / "settings.json") -> None:
     for ev in ["UserPromptSubmit", *EVENTS]:
         keep = [g for g in hooks.get(ev, []) if not any("notify.py" in (h.get("command") or "")
                                                         for h in g.get("hooks", []))]
-        hook = {"type": "command", "command": f'python "{script}" {ev}', "timeout": 5 if ev == "UserPromptSubmit" else 10}
+        # the Python running this install, by full path: "python" alone is often not on PATH on a managed laptop
+        exe = Path(sys.executable).as_posix()
+        hook = {"type": "command", "command": f'"{exe}" "{script}" {ev}', "timeout": 5 if ev == "UserPromptSubmit" else 10}
         if ev != "UserPromptSubmit":
             hook["async"] = True
         hooks[ev] = keep + [{"hooks": [hook]}]
