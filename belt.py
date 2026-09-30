@@ -573,6 +573,7 @@ class Sampler:
             self.snap["procs"] = rows
             self.snap["helpers"] = helpers
             self.snap["leftovers"] = leftovers
+            self.snap["servers"] = self._servers
 
     def _helpers(self, rows: list[dict]) -> tuple[dict, list[dict]]:
         """Split background processes into the ones Claude Code chats own
@@ -594,7 +595,23 @@ class Sampler:
                 rss += c["rss"]
                 stack.extend(children[c["pid"]])
 
-        leftovers = []
+        listening: dict = defaultdict(set)                # pid -> ports it listens on
+        try:
+            for c in psutil.net_connections(kind="inet"):
+                if c.status == psutil.CONN_LISTEN and c.pid:
+                    listening[c.pid].add(c.laddr.port)
+        except (psutil.Error, OSError):
+            pass
+
+        def ports(pid: int) -> set:
+            found, stack = set(listening.get(pid, ())), list(children[pid])
+            while stack:
+                c = stack.pop()
+                found |= listening.get(c["pid"], set())
+                stack.extend(children[c["pid"]])
+            return found
+
+        leftovers, servers = [], []
         for r in rows:
             if r["name"].lower() not in LEFTOVER_NAMES or r["pid"] in self._own:
                 continue
@@ -605,10 +622,11 @@ class Sampler:
             if "GPU Engine" in cmd:
                 what = "GPU counter loop from a closed UtilityBelt"
             else:
-                script = next((Path(t.strip('"')).name for t in cmd.split()
-                               if t.strip('"').lower().endswith((".py", ".js", ".mjs", ".ps1"))), "")
-                what = script or cmd[:60] or r["name"]
-            leftovers.append(dict(r, what=what, age=time.time() - r["created"]))
+                what = describe_cmd(cmd) or r["name"]
+            served = ports(r["pid"])
+            record = dict(r, what=what, age=time.time() - r["created"], ports=sorted(served))
+            (servers if orphan_kind(r["name"], bool(served)) == "server" else leftovers).append(record)
+        self._servers = servers
         return {"sessions": len(backends), "count": count, "rss": rss}, leftovers
 
     def _sample_disks(self) -> None:
@@ -988,6 +1006,28 @@ class Sampler:
     def read(self) -> dict:
         with self.lock:
             return dict(self.snap)
+
+
+def describe_cmd(cmd: str) -> str:
+    """A short name for a script process: its script file, or python -m <module>."""
+    tokens = [t.strip('"') for t in cmd.split()]
+    script = next((Path(t).name for t in tokens
+                   if t.lower().endswith((".py", ".js", ".mjs", ".ps1"))), "")
+    if script:
+        return script
+    if "-m" in tokens[:-1]:
+        return f"python -m {tokens[tokens.index('-m') + 1]}"
+    return cmd[:60]
+
+
+def orphan_kind(name: str, serving: bool) -> str:
+    """A script process whose parent has gone: left behind, or a background
+    server started that way on purpose? Launchers (e.g. Startup-folder
+    shortcuts) start a server and exit, so the server serving a port, or run
+    windowless with pythonw, is deliberate."""
+    if serving or name.lower() == "pythonw.exe":
+        return "server"
+    return "leftover"
 
 
 def session_state(last_kind: str, age: float) -> str:
@@ -2070,6 +2110,14 @@ class Belt(App):
                        "closes theirs.[/]")
         else:
             out.append("  [dim]no Claude Code chats loaded[/]")
+        servers = snap.get("servers") or []
+        if servers:
+            out += ["", "[bold]background servers[/]  [dim]started by a launcher that has since "
+                    "exited — on purpose, e.g. from the Startup folder[/]"]
+            for p in servers:
+                port = ", ".join(f":{n}" for n in p["ports"]) or "windowless"
+                out.append(f"  {p['pid']:>7}  {escape(p['name']):<16} {human_bytes(p['rss']):>9}  "
+                           f"[dim]{duration(p['age'])} old[/]  {escape(port):<10} {escape(p['what'])}")
         out += ["", "[bold]leftover processes[/]  [dim]script processes whose parent has closed[/]"]
         if not left:
             out.append("  [green]none[/]")
