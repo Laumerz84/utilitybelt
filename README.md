@@ -41,7 +41,7 @@ Lines never wrap — they end in an ellipsis.
 | Storage | read/write graph, per-volume capacity, lifetime bytes and op counts per device |
 | Network | download and upload graphs, Tailscale, per-interface totals, errors, sockets |
 | Claude | which chats are working, waiting on you, or probably stuck on a permission prompt; per-model token and cost table |
-| Agents | every subagent transcript: last tool used, workflow, calls, cost, age |
+| Agents | every working subagent live: its task, type, model, which chat started it, what it is doing right now and for how long, and its last 8 steps; then the recently finished ones. Click one (or ↑/↓ and Enter) to watch it: its task, Claude's output in full, thinking (when the log kept the words), every tool call with its full input, and results, following new steps like `tail -f` while scrolled to the bottom |
 | Processes | Claude Code helpers (each loaded chat's MCP servers), leftover script processes whose parent has closed, then top processes |
 | Health (`h`) | everything flagged, the Windows event log for 7 days (hardware/WHEA errors, blue screens, GPU driver resets, unexpected restarts, app crashes), board, BIOS, CPU, RAM and driver versions |
 
@@ -126,6 +126,14 @@ a sound actually plays rather than trusting the exit code.
 
 The `.wav` files are committed so a fresh clone works without running
 `make-chime.py` first.
+
+## Tests
+
+```
+python -m unittest discover -s tests
+```
+
+`agentlog.py` reads agent logs incrementally (only what was appended since the last read), so following working agents stays cheap however long their logs get.
 
 ## Costs
 

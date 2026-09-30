@@ -56,15 +56,25 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psutil
-from rich.markup import escape
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
-from textual.containers import Grid, VerticalScroll
+from textual.binding import Binding
+from textual.containers import Grid, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Static
 
-_JOB = None                     # Windows job that owns our child processes
+import agentlog
+
+
+def escape(text) -> str:
+    """Make any text safe to show inside Textual markup. Every "[" is escaped:
+    rich's and Textual's own escape functions both let some code through
+    (e.g. `[[T("x", c="dim")]]` from an agent's tool input) and the whole view
+    then fails to render."""
+    return str(text).replace("[", "\\[")
+
+_JOB = None                    # Windows job that owns our child processes
 
 
 def _die_with_this_process(proc) -> None:
@@ -448,6 +458,12 @@ class Sampler:
         threading.Thread(target=self._gpu_loop, daemon=True).start()
         threading.Thread(target=self._info_loop, daemon=True).start()
 
+        # Live agent feed: an AgentLog per followed transcript, read incrementally.
+        self._agent_logs: dict[Path, agentlog.AgentLog] = {}
+        self._watched: set[Path] = set()          # open in the agent view: follow even when idle
+        self._titles: dict[str, str] = {}         # session id -> chat title, from _sample_claude
+        threading.Thread(target=self._agent_loop, daemon=True).start()
+
     # -- fast: every second, cheap counters only
     def _fast_loop(self) -> None:
         psutil.cpu_percent(percpu=True)          # prime; first call is garbage
@@ -798,6 +814,79 @@ class Sampler:
             }
             self.snap["agents"] = agents
             self.snap["claude_ready"] = True
+            self._titles = {s["path"].stem: s["title"] for s in sessions}
+
+    # -- live agents: every second, only the lines appended to working agents' logs
+    def _agent_loop(self) -> None:
+        """Follow working subagents. Finding them costs a stat per agent log
+        (every 3 s); reading them costs only what was appended since last time."""
+        tick = 0
+        candidates: list[Path] = []
+        while not self.stop.wait(1.0):
+            try:
+                now = time.time()
+                if tick % 3 == 0 and PROJECTS.exists():
+                    candidates = []
+                    for path in PROJECTS.glob("*/*/subagents/**/agent-*.jsonl"):
+                        try:
+                            if now - path.stat().st_mtime < AGENT_LIVE_SECONDS:
+                                candidates.append(path)
+                        except OSError:
+                            continue
+                tick += 1
+                with self.lock:
+                    follow = set(candidates) | self._watched
+                for path in follow:
+                    log = self._agent_logs.get(path)
+                    if log is None:
+                        log = self._agent_logs[path] = agentlog.AgentLog(path)
+                    with self.lock:
+                        log.poll()
+                live = []
+                for path in candidates:
+                    log = self._agent_logs[path]
+                    live.append(self._agent_summary(log, now))
+                live.sort(key=lambda a: a["started"])
+                with self.lock:
+                    self.snap["live_agents"] = live
+                    for path in list(self._agent_logs):     # forget agents nobody is following
+                        if path not in follow and len(self._agent_logs) > 40:
+                            del self._agent_logs[path]
+            except Exception as exc:
+                self._note(f"agents: {exc}")
+
+    def _agent_summary(self, log: agentlog.AgentLog, now: float) -> dict:
+        evs = log.events
+        meta = log.meta
+        session_dir = next((p for p in log.path.parents if p.name == "subagents"), log.path.parent).parent
+        workflow = next((p.name for p in log.path.parents if p.name.startswith("wf_")), "")
+        return {
+            "path": log.path,
+            "id": log.path.stem.replace("agent-", "")[:10],
+            "desc": meta.get("description") or next((e["text"][:60] for e in evs if e["kind"] == "task"), ""),
+            "type": meta.get("agentType") or "", "model": meta.get("model") or "",
+            "chat": self._titles.get(session_dir.name, ""), "workflow": workflow,
+            "started": evs[0]["ts"] if evs else now,
+            "tools": sum(1 for e in evs if e["kind"] == "tool"),
+            "errors": sum(1 for e in evs if e["kind"] == "result" and e["error"]),
+            "now": agentlog.now_step(evs),
+            "recent": [e for e in evs if e["kind"] not in ("task", "system")][-8:],
+        }
+
+    def watch_agent(self, path: Path, on: bool = True) -> None:
+        """Keep following an agent while its view is open, even after it goes quiet."""
+        with self.lock:
+            (self._watched.add if on else self._watched.discard)(path)
+
+    def agent_view(self, path: Path) -> tuple[list[dict], dict]:
+        """A copy of one agent's events (read so far) and its summary."""
+        log = self._agent_logs.get(path)
+        if log is None:
+            log = self._agent_logs[path] = agentlog.AgentLog(path)
+        with self.lock:
+            if not log.events:
+                log.poll()
+            return list(log.events), self._agent_summary(log, time.time())
 
     @staticmethod
     def _read_transcript(path: Path, today: str) -> dict | None:
@@ -1128,6 +1217,139 @@ class Detail(Screen):
             "[dim]esc back · 1-8 other panels · h health · q back[/]")
 
 
+class AgentBlock(Static):
+    """One agent in the Agents list; click (or Enter) opens its live view."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(classes="agent-block")
+        self.path = path
+
+    def on_click(self, event: events.Click) -> None:
+        self.app.open_agent(self.path)
+
+
+class AgentsScreen(Detail):
+    """Working agents as live blocks, then the recently finished ones."""
+
+    BINDINGS = Detail.BINDINGS + [
+        Binding("up", "move(-1)", "Up", priority=True),
+        Binding("down", "move(1)", "Down", priority=True),
+        Binding("enter", "open", "Open", priority=True),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__("agents")
+        self.selected = 0
+        self.paths: list[Path] = []
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="dtitle")
+        with VerticalScroll(id="detail-body"):
+            yield Static(id="agents-head")
+            yield Vertical(id="agent-blocks")
+            yield Static(id="agents-foot")
+        yield Static(id="dhint")
+
+    def redraw(self) -> None:
+        app = self.app
+        snap = app.sampler.read()
+        live = snap.get("live_agents") or []
+        live_paths = {a["path"] for a in live}
+        done = [a for a in snap.get("agents") or [] if a["path"] not in live_paths][:10]
+        rows = [("live", a) for a in live] + [("done", a) for a in done]
+        paths = [a["path"] for _, a in rows]
+        box = self.query_one("#agent-blocks", Vertical)
+        if paths != self.paths:                           # agent set changed: rebuild the blocks
+            keep = self.paths[self.selected] if self.paths and self.selected < len(self.paths) else None
+            box.remove_children()
+            box.mount_all([AgentBlock(p) for p in paths])
+            self.paths = paths
+            self.selected = paths.index(keep) if keep in paths else 0
+        width = max(40, self.size.width - 10)
+        for i, (block, (kind, a)) in enumerate(zip(box.query(AgentBlock), rows)):
+            block.set_class(i == self.selected, "-selected")
+            block.set_class(kind == "done", "-done")
+            block.update(app.render_agent_block(a, width) if kind == "live"
+                         else app.render_agent_done(a))
+        self.query_one("#dtitle", Static).update(
+            f"[bold]UtilityBelt[/] [dim]›[/] [bold]Agents[/]   [dim]{datetime.now():%H:%M:%S}[/]")
+        seen = (f"{len(snap.get('agents') or [])} seen in total" if snap.get("claude_ready")
+                else "scanning older agents…")
+        self.query_one("#agents-head", Static).update(
+            f"[bold]{len(live)}[/] working now  [dim]· {seen} · click one, or ↑/↓ and Enter, "
+            f"to watch it live[/]"
+            + ("" if live else "\n\n[dim]No agent is working right now.[/]"))
+        self.query_one("#agents-foot", Static).update(
+            f"\n[dim]'Working' means its log was written to in the last {AGENT_LIVE_SECONDS}s. "
+            f"Steps appear as each one finishes.[/]")
+        self.query_one("#dhint", Static).update(
+            "[dim]↑/↓ choose · enter or click to watch · esc back · 1-8 other panels · q back[/]")
+
+    def action_move(self, step: int) -> None:
+        if not self.paths:
+            return
+        self.selected = (self.selected + step) % len(self.paths)
+        blocks = list(self.query(AgentBlock))
+        for i, block in enumerate(blocks):
+            block.set_class(i == self.selected, "-selected")
+        if self.selected < len(blocks):
+            blocks[self.selected].scroll_visible()
+
+    def action_open(self) -> None:
+        if self.paths:
+            self.app.open_agent(self.paths[self.selected])
+
+
+class AgentView(Detail):
+    """Everything one agent has done, from its task on, following new steps
+    as they land (like tail -f) while the view is scrolled to the bottom."""
+
+    BINDINGS = Detail.BINDINGS + [("f", "follow", "Follow"), ("end", "follow", "Follow")]
+
+    def __init__(self, path: Path) -> None:
+        super().__init__("agent")
+        self.path = path
+        self.following = True
+        self.rendered = -1
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="dtitle")
+        yield Static(id="agent-head")
+        with VerticalScroll(id="detail-body"):
+            yield Static(id="detail-content")
+        yield Static(id="dhint")
+
+    def on_mount(self) -> None:
+        self.app.sampler.watch_agent(self.path)
+        super().on_mount()
+
+    def on_unmount(self) -> None:
+        self.app.sampler.watch_agent(self.path, on=False)
+
+    def redraw(self) -> None:
+        app = self.app
+        evs, a = app.sampler.agent_view(self.path)
+        body = self.query_one("#detail-body", VerticalScroll)
+        if self.rendered >= 0:                            # at the bottom = following
+            self.following = body.scroll_y >= body.max_scroll_y - 1
+        self.query_one("#dtitle", Static).update(
+            f"[bold]UtilityBelt[/] [dim]› Agents ›[/] [bold]{escape(a['desc'][:70] or a['id'])}[/]"
+            f"   [dim]{datetime.now():%H:%M:%S}[/]")
+        self.query_one("#agent-head", Static).update(app.render_agent_head(a, evs))
+        if len(evs) != self.rendered:
+            self.query_one("#detail-content", Static).update(app.render_agent_feed(evs))
+            self.rendered = len(evs)
+            if self.following:
+                self.call_after_refresh(body.scroll_end, animate=False)
+        state = "[green]following new steps[/]" if self.following else "[yellow]paused[/] [dim]· f to follow[/]"
+        self.query_one("#dhint", Static).update(
+            f"{state}   [dim]scroll up to pause · f / end follow · esc back[/]")
+
+    def action_follow(self) -> None:
+        self.following = True
+        self.query_one("#detail-body", VerticalScroll).scroll_end(animate=False)
+
+
 # ---------------------------------------------------------------------- app
 
 class Belt(App):
@@ -1159,6 +1381,12 @@ class Belt(App):
     #dtitle { height: 1; padding: 0 2; background: $panel; }
     #detail-body { padding: 1 3; }
     #dhint { height: 1; padding: 0 2; }
+    #agent-head { height: auto; padding: 0 3; background: $panel; }
+    #agent-blocks { height: auto; }
+    .agent-block { height: auto; padding: 0 1; margin: 1 0 0 0; border-left: blank; }
+    .agent-block.-done { margin: 0; }
+    .agent-block:hover { background: $boost; }
+    .agent-block.-selected { border-left: thick $accent; background: $boost; }
     """
 
     BINDINGS = [
@@ -1198,9 +1426,133 @@ class Belt(App):
             overview.redraw()
 
     def open_detail(self, key: str) -> None:
-        if isinstance(self.screen, Detail):
+        while isinstance(self.screen, Detail):
             self.pop_screen()
-        self.push_screen(Detail(key))
+        self.push_screen(AgentsScreen() if key == "agents" else Detail(key))
+
+    def open_agent(self, path: Path) -> None:
+        self.push_screen(AgentView(path))
+
+    # ---- agents
+
+    @staticmethod
+    def _event_line(e: dict, width: int) -> str:
+        """One step as a single line: time, kind mark, the gist."""
+        t = f"[dim]{datetime.fromtimestamp(e['ts']):%H:%M:%S}[/]" if e["ts"] else "[dim]--:--:--[/]"
+        first = escape(agentlog._first_line(e["text"])[:width])
+        kind = e["kind"]
+        if kind == "tool":
+            return f"{t}  [bold]▸ {escape(e['tool'])}[/] {first}"
+        if kind == "output":
+            return f"{t}  ✎ {first}"
+        if kind == "thinking":
+            return f"{t}  [dim italic]· thinking{': ' + first if first else ''}[/]"
+        if kind == "result" and e["error"]:
+            return f"{t}  [red]✗ {first or 'failed'}[/]"
+        if kind == "result":
+            return f"{t}  [dim]← {first or '(no output)'}[/]"
+        return f"{t}  [dim]task: {first}[/]"
+
+    @staticmethod
+    def _since(ts: float) -> str:
+        return duration(time.time() - ts) if ts else "—"
+
+    def render_agent_block(self, a: dict, width: int) -> str:
+        step = a["now"]
+        waited = time.time() - step["since"] if step["since"] else 0
+        slow = "yellow" if step["label"] not in ("thinking", "writing") and waited > 120 else "bold"
+        where = " · ".join(x for x in (a["chat"] and f"from {escape(a['chat'][:40])}",
+                                       a["workflow"] and escape(a["workflow"][:16])) if x)
+        errs = f" · [red]{a['errors']} failed[/]" if a["errors"] else ""
+        lines = [f"[green]●[/] [bold]{escape(a['desc'][:width - 30] or a['id'])}[/]  "
+                 f"[dim]{escape(a['type'])} · {escape(a['model'])} · running {self._since(a['started'])} · "
+                 f"{a['tools']} tool calls[/]{errs}",
+                 f"  [dim]{where}[/]" if where else "",
+                 f"  now  [{slow}]{escape(step['label'][:width - 20])}[/]  [dim]for {duration(waited)}[/]"]
+        lines += [f"  {self._event_line(e, width - 14)}" for e in a["recent"]]
+        return "\n".join(x for x in lines if x)
+
+    def render_agent_done(self, a: dict) -> str:
+        """A finished agent from the full transcript scan: one compact line."""
+        desc = self._agent_desc(a["path"]) or a["title"]
+        return (f"[dim]○[/] {escape(desc[:60])}  [dim]{a['calls']} calls · last tool "
+                f"{escape(a['last_tool'] or '—')} · finished {duration(a['age'])} ago[/]")
+
+    def _agent_desc(self, path: Path) -> str:
+        cache = self.__dict__.setdefault("_desc_cache", {})
+        if path not in cache:
+            try:
+                cache[path] = json.loads(path.with_name(path.stem + ".meta.json")
+                                         .read_text(encoding="utf-8")).get("description") or ""
+            except (OSError, ValueError):
+                cache[path] = ""
+        return cache[path]
+
+    def render_agent_head(self, a: dict, evs: list[dict]) -> str:
+        step = a["now"]
+        live = evs and time.time() - max(e["ts"] for e in evs[-3:]) < AGENT_LIVE_SECONDS
+        where = " · ".join(x for x in (a["chat"] and f"from {escape(a['chat'][:50])}",
+                                       a["workflow"] and escape(a["workflow"])) if x)
+        status = (f"now [bold]{escape(step['label'][:90])}[/] [dim]for {self._since(step['since'])}[/]"
+                  if live else f"[dim]finished · last step {self._since(step['since'])} ago[/]")
+        return (f"[dim]{escape(a['type'])} · {escape(a['model'])} · {where} · started "
+                f"{self._since(a['started'])} ago · {a['tools']} tool calls"
+                + (f" · [red]{a['errors']} failed[/]" if a["errors"] else "") + f"[/]\n{status}")
+
+    @staticmethod
+    def render_agent_feed(evs: list[dict], limit: int = 500) -> str:
+        """The whole log, each step labelled by what it is. Output is Claude's
+        actual words, full brightness; thinking is dim italic; tools show their
+        full input; results are cut to their first lines."""
+        out = []
+        if len(evs) > limit:
+            out.append(f"[dim]… {len(evs) - limit} earlier steps not shown[/]\n")
+            evs = evs[-limit:]
+
+        def clip(text: str, n: int) -> tuple[str, str]:
+            lines = text.rstrip().splitlines()
+            more = f"\n[dim]  (+{len(lines) - n} more lines)[/]" if len(lines) > n else ""
+            return escape("\n".join(lines[:n])), more
+
+        hidden_thinking = 0
+        for e in evs:
+            if e["kind"] == "thinking" and not e["text"].strip():
+                hidden_thinking += 1
+                continue
+            if hidden_thinking:
+                out.append(f"[dim italic]thinking{f' ×{hidden_thinking}' if hidden_thinking > 1 else ''}"
+                           f" — not recorded[/]\n")
+                hidden_thinking = 0
+            t = f"[dim]{datetime.fromtimestamp(e['ts']):%H:%M:%S}[/]  " if e["ts"] else ""
+            kind = e["kind"]
+            if kind == "task":
+                text, more = clip(e["text"], 8)
+                out.append(f"{t}[bold]TASK[/]\n[dim]{text}[/]{more}\n")
+            elif kind == "system":
+                inner = e["text"].replace("<system-reminder>", "").replace("</system-reminder>", "").strip()
+                text, more = clip(inner, 2)
+                out.append(f"{t}[dim]NOTE FROM CLAUDE CODE\n{text}[/]{more}\n")
+            elif kind == "thinking":
+                out.append(f"{t}[dim italic]THINKING\n{escape(e['text'].rstrip())}[/]\n")
+            elif kind == "output":
+                out.append(f"{t}[bold]OUTPUT[/]\n{escape(e['text'].rstrip())}\n")
+            elif kind == "tool":
+                if e["tool"] in ("Bash", "PowerShell"):
+                    detail = escape(json.loads(e["full"]).get("command", "")) if e["full"] else ""
+                    out.append(f"{t}[bold]▸ {escape(e['tool'])}[/]\n{detail}\n")
+                else:
+                    text, more = clip(e["full"], 15)
+                    out.append(f"{t}[bold]▸ {escape(e['tool'])}[/]  {escape(e['text'])}\n[dim]{text}[/]{more}\n")
+            elif kind == "result" and e["error"]:
+                text, more = clip(e["text"], 12)
+                out.append(f"{t}[red]✗ FAILED\n{text}[/]{more}\n")
+            else:
+                text, more = clip(e["text"], 6)
+                out.append(f"{t}[dim]← RESULT\n{text or '(no output)'}[/]{more}\n")
+        if hidden_thinking:
+            out.append(f"[dim italic]thinking{f' ×{hidden_thinking}' if hidden_thinking > 1 else ''}"
+                       f" — not recorded[/]")
+        return "\n".join(out) or "[dim]Nothing in this agent's log yet.[/]"
 
     # ---- top bar and mini strip
 
@@ -1385,11 +1737,12 @@ class Belt(App):
         agents = snap.get("agents") or []
         if not agents:
             return ["[dim]no agent transcripts[/]"], OK
-        live = [a for a in agents if a["live"]]
-        lines = [f"[bold]{len(live)}[/] [dim]working now[/]"]
-        for a in live[:h - 1]:
-            lines.append(f"[green]●[/] {a['last_tool'] or 'thinking'} [dim]· "
-                         f"{escape(a['title'])}[/]")
+        live = snap.get("live_agents") or []
+        lines = [f"[bold]{len(live)}[/] [dim]working now · 7 to watch[/]"]
+        for a in live[:max(1, (h - 1) // 2)]:           # two lines each: what it is, what it's doing
+            step = a["now"]
+            lines.append(f"[green]●[/] {escape(a['desc'] or a['id'])}")
+            lines.append(f"  [dim]{escape(step['label'])} · {self._since(step['since'])}[/]")
         if not live:
             lines.append(f"[dim]last one finished {duration(agents[0]['age'])} ago[/]")
         return lines, OK
@@ -1630,24 +1983,6 @@ class Belt(App):
                        f"{escape(sess['title'][:50])}")
         out += ["", "[dim]Costs are API list rates applied to the transcript logs. "
                 "Your plan is billed differently — /usage is authoritative.[/]"]
-        return "\n".join(out)
-
-    def _detail_agents(self, snap, s, width) -> str:
-        agents = snap.get("agents") or []
-        if not agents:
-            return "[dim]No agent transcripts found.[/]"
-        live = [a for a in agents if a["live"]]
-        out = [f"[bold]{len(live)}[/] working now  [dim]· {len(agents)} seen in total · "
-               f"'working' means the log was written to within {AGENT_LIVE_SECONDS}s[/]", ""]
-        for a in agents[:20]:
-            dot = "[green]●[/]" if a["live"] else "[dim]○[/]"
-            tool = a["last_tool"] or "—"
-            wf = f" [dim]{escape(a['workflow'][:14])}[/]" if a["workflow"] else ""
-            out += [f"{dot} [bold]{a['id']}[/]{wf}  [dim]{duration(a['age'])} since "
-                    f"last write[/]",
-                    f"    last tool [bold]{escape(tool)}[/]  ·  {a['calls']} calls  ·  "
-                    f"[dim]${a['cost']:,.2f}[/]",
-                    f"    [dim]{escape(a['title'][:76])}[/]"]
         return "\n".join(out)
 
     def _detail_processes(self, snap, s, width) -> str:
