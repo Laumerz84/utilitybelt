@@ -13,7 +13,10 @@ Three levels of detail:
              Escape goes back.
 
 Everything repaints once a second; nothing here starts, stops, or changes
-anything on the machine.
+anything on the machine. The one exception is the update check: at start and
+every 6 hours a background `git fetch` asks GitHub whether a newer UtilityBelt
+exists (update_check.py). If so, the hint line says so and u shows what's new
+and the command to run - nothing is ever updated automatically.
 
 Display rules
 -------------
@@ -64,7 +67,10 @@ from textual.containers import Grid, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Static
 
+import update_check
+
 _JOB = None                     # Windows job that owns our child processes
+UPDATE_EVERY = 6 * 3600         # seconds between checks for a newer version on GitHub
 
 
 def _die_with_this_process(proc) -> None:
@@ -1092,6 +1098,10 @@ class Overview(Screen):
             card.update("\n".join(lines[:h]))
         errs = snap.get("errors") or []
         note = f"   [red]{escape(errs[-1])}[/]" if errs else ""
+        info = app.update_info
+        if info is not None and info.available:
+            n = info.behind
+            note = f"   [bold yellow]⬆ Update available ({n} new change{'s' if n != 1 else ''}) · u to update[/]" + note
         self.query_one("#hint", Static).update(
             "[dim]1-8 open a panel · h health · m mini view · q quit[/]" + note)
 
@@ -1101,7 +1111,7 @@ class Detail(Screen):
 
     TITLES = {"cpu": "CPU", "memory": "Memory", "gpu": "GPU", "storage": "Storage",
               "network": "Network", "claude": "Claude", "agents": "Agents",
-              "processes": "Processes", "health": "Health"}
+              "processes": "Processes", "health": "Health", "update": "Update"}
 
     def __init__(self, key: str) -> None:
         super().__init__()
@@ -1125,7 +1135,7 @@ class Detail(Screen):
         self.query_one("#detail-content", Static).update(
             self.app.render_detail(self.key, snap, max(40, self.size.width - 8)))
         self.query_one("#dhint", Static).update(
-            "[dim]esc back · 1-8 other panels · h health · q back[/]")
+            "[dim]esc back · 1-8 other panels · h health · u update · q back[/]")
 
 
 # ---------------------------------------------------------------------- app
@@ -1173,6 +1183,8 @@ class Belt(App):
         ("8", "detail('processes')", "Processes"),
         ("h", "detail('health')", "Health"),
         ("m", "toggle_mini", "Mini"),
+        ("u", "detail('update')", "Update"),
+        ("c", "copy_update", "Copy update command"),
     ]
 
     TITLE = "UtilityBelt"
@@ -1181,9 +1193,41 @@ class Belt(App):
         super().__init__()
         self.sampler = sampler
         self.forced_mode = "mini" if mini else None
+        self.update_info: update_check.UpdateInfo | None = None
+        self.update_checked_at: datetime | None = None
+        self._update_thread: threading.Thread | None = None
 
     def on_mount(self) -> None:
         self.push_screen(Overview())
+        self.start_update_check()
+        self.set_interval(UPDATE_EVERY, self.start_update_check)
+
+    # ---- is there a newer UtilityBelt on GitHub? (background; never blocks a frame)
+
+    def start_update_check(self) -> None:
+        if self._update_thread is not None and self._update_thread.is_alive():
+            return
+
+        def run() -> None:
+            info = update_check.check()
+            if info is not None:  # offline etc. keeps the last answer
+                self.update_info = info
+            self.update_checked_at = datetime.now()
+
+        self._update_thread = threading.Thread(target=run, name="update-check", daemon=True)
+        self._update_thread.start()
+
+    def action_copy_update(self) -> None:
+        info = self.update_info
+        if info is None or not info.available:
+            return
+        text = "\n".join(info.commands())
+        try:
+            subprocess.run(["clip"], input=text, text=True, check=True, timeout=5,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            self.copy_to_clipboard(text)  # terminals that support OSC 52
+        self.notify("Update command copied - quit UtilityBelt (q), then paste it into a terminal.")
 
     def action_detail(self, key: str) -> None:
         self.open_detail(key)
@@ -1258,11 +1302,13 @@ class Belt(App):
             net += "   Tailscale " + ("[green]✓[/]" if ts else "[yellow]off[/]")
         line2 = f"{net}   {self._claude_summary(snap)}"
 
+        info = self.update_info
+        update = "[yellow]⬆ update (u)[/]  " if info is not None and info.available else ""
         return Text("\n").join([
             self._line(line1, "", width),
             self._line(line2, "", width),
             self._line(self._alert_text(alerts, limit=3),
-                       f"[dim]{datetime.now():%H:%M}[/]", width),
+                       f"{update}[dim]{datetime.now():%H:%M}[/]", width),
         ])
 
     @staticmethod
@@ -1418,6 +1464,30 @@ class Belt(App):
             return getattr(self, f"_detail_{key}")(snap, self.sampler, width)
         except Exception as exc:
             return f"[red]{escape(type(exc).__name__)}: {escape(str(exc))}[/]"
+
+    def _detail_update(self, snap, s, width) -> str:
+        info, at = self.update_info, self.update_checked_at
+        when = f"[dim]Last checked {at:%H:%M}; checks again every {UPDATE_EVERY // 3600} hours.[/]" if at else ""
+        if info is None:
+            if at is None:
+                return "[dim]Checking GitHub for a newer version…[/]"
+            return ("Can't check for updates from here: git isn't installed, this copy wasn't made "
+                    "with git clone, or GitHub couldn't be reached.\n\n" + when)
+        if not info.available:
+            return f"[green]✓[/] UtilityBelt is up to date.\n\n{when}"
+        n = info.behind
+        lines = [f"[bold yellow]⬆ {n} new change{'s' if n != 1 else ''} on GitHub[/]", "", "[bold]What's new[/]"]
+        lines += [f"  • {escape(t)}" for t in info.titles]
+        if n > len(info.titles):
+            lines.append(f"  [dim]…and {n - len(info.titles)} more[/]")
+        lines += ["", "[bold]To update[/]", "  1. Quit UtilityBelt (q).",
+                  "  2. Open a terminal and run:"]
+        lines += [f"       [bold]{escape(cmd)}[/]" for cmd in info.commands()]
+        if info.deps_changed:
+            lines.append("     [dim](the second line installs new packages this version needs)[/]")
+        lines += ["  3. Start UtilityBelt again.", "",
+                  "[dim]c copies the command" + ("s" if len(info.commands()) > 1 else "") + ".[/]", when]
+        return "\n".join(lines)
 
     @staticmethod
     def _graph(points, width, lvl=OK, top=100.0, label="") -> list[str]:

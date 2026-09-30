@@ -109,6 +109,13 @@ python sounds.py --install # optional: Claude Code sounds and status line (resta
 Only `belt.py` needs the packages. Everything else is standard library.
 Ollama and Tailscale are optional: their panels say "not running" without them.
 
+**Updates.** The dashboard checks GitHub for a newer version when it starts and
+every 6 hours (a quiet `git fetch`; it never updates anything by itself). When
+there is one, the bottom line says so; press `u` to see what's new and the
+command to run, and `c` to copy it. You can also check by hand with
+`python update_check.py`. This needs the `git clone` install above; a ZIP
+download can't tell which version it is.
+
 **NVIDIA card?** GPU load and VRAM work as-is, but this was built on an AMD
 card. `NVIDIA-SETUP.md` has a prompt to give Claude Code that adds NVIDIA's
 temperature, fan, power and clock readings.
