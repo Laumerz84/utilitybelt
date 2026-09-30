@@ -5,6 +5,7 @@ __pycache__/
 # Local state written by the tools, not source
 .disk-snapshot.json
 *.log
+.tmp-tests/
 
 # Editors / OS
 .vscode/
