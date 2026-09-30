@@ -103,6 +103,7 @@ cd utilitybelt
 pip install -r requirements.txt
 python belt.py --probe     # checks every reading; should list your CPU, RAM, GPU, disks
 belt.cmd                   # the dashboard
+python sounds.py --install # optional: Claude Code sounds and status line (restart Claude Code after)
 ```
 
 Only `belt.py` needs the packages. Everything else is standard library.
@@ -117,10 +118,11 @@ temperature, fan, power and clock readings.
 Optional — only if you want the notification sounds and status line.
 `~/.claude/settings.json` calls into this folder by absolute path — seven
 notification hooks pointing at `notify.py`, and one status line pointing at
-`statusline.ps1`. **Moving or renaming this directory breaks all eight
-silently:** the hooks still fire and still exit 0, they just stop making any
-sound. If you move it, update those paths and then confirm a sound actually
-plays rather than trusting the exit code.
+`statusline.ps1`. `python sounds.py --install` writes all eight for wherever
+this folder is. **Moving or renaming this directory breaks them silently:**
+the hooks still fire and still exit 0, they just stop making any sound. If you
+move it, run `python sounds.py --install` again from the new place and confirm
+a sound actually plays rather than trusting the exit code.
 
 The `.wav` files are committed so a fresh clone works without running
 `make-chime.py` first.
@@ -137,5 +139,8 @@ rates applied to the local transcript logs. Plan billing works differently —
   length, and whether to stay silent while Claude is in front. `s` saves `sounds.json`.
 - Share them: commit and push `sounds.json`; on the other computer, pull.
 - Set up another computer (Windows, Python on PATH): clone this repo, then run `python sounds.py --install` in it.
-  It points that computer's Claude Code hooks at this folder's `notify.py`, backs up `~/.claude/settings.json`
-  first and keeps any other hooks. Restart Claude Code afterwards.
+  It points that computer's Claude Code hooks at this folder's `notify.py` and its status line at
+  `statusline.ps1` (an existing status line from something else is left alone). It creates
+  `~/.claude/settings.json` and `sounds.json` if either is missing, backs up an existing settings.json first,
+  keeps any other hooks and settings, and refuses to touch a settings.json it cannot read. Running it twice
+  is harmless. Restart Claude Code afterwards.

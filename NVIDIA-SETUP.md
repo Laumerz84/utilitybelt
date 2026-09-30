@@ -88,10 +88,10 @@ runs on background threads.
 **4. Wire it to my machine**
 - `belt.py`, `belt.cmd` and `belt-mini.cmd` work from any folder, so they
   need nothing.
-- The notification sounds and status line (see "Wiring" in the README) are
-  optional. If I want them, update the absolute paths in my
-  `~/.claude/settings.json` to where I cloned this folder. Show me the change
-  before saving it.
+- The notification sounds and status line are optional and have their own
+  installer. If `~/.claude/settings.json` doesn't already point its hooks at
+  this folder's `notify.py`, ask whether I want them. If I do, run
+  `python sounds.py --install`. It backs up and keeps my existing settings.
 - Offer to pin `belt.cmd` and `belt-mini.cmd` to my taskbar.
 
 **5. Prove it works**

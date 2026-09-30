@@ -2,8 +2,10 @@
 """Choose which sound each Claude Code event plays, or none. Saves sounds.json beside notify.py.
 
     python sounds.py             the menu
-    python sounds.py --install   point this computer's Claude Code hooks at this folder's notify.py
-                                 (~/.claude/settings.json is backed up first; other hooks are kept)
+    python sounds.py --install   point this computer's Claude Code hooks at this folder's notify.py,
+                                 and its status line at statusline.ps1. Creates ~/.claude/settings.json
+                                 and sounds.json if they are missing; an existing settings.json is backed
+                                 up first and its other hooks and settings are kept.
 
 Share the settings between computers through git: commit and push sounds.json here, pull it there.
 """
@@ -69,9 +71,20 @@ def menu() -> None:
 
 
 def install(path: Path = Path.home() / ".claude" / "settings.json") -> None:
-    s = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    try:
+        s = json.loads(path.read_text(encoding="utf-8") or "{}") if path.exists() else {}
+        if not isinstance(s, dict):
+            raise ValueError("top level is not an object")
+    except ValueError as exc:                            # never overwrite a file we cannot read
+        sys.exit(f"{path} is not valid JSON ({exc}); fix or move it, then run this again. Nothing was changed.")
     if path.exists():
         shutil.copy2(path, path.with_name(f"settings.json.bak-{time.strftime('%Y%m%d-%H%M%S')}"))
+    else:
+        print(f"no {path} yet - creating it")
+    if not notify.SETTINGS.exists():                     # the sound choices; notify.py falls back without it
+        shared = {k: v for k, v in notify.DEFAULTS.items() if k != "volume"}
+        notify.SETTINGS.write_text(json.dumps(shared, indent=2) + "\n", encoding="utf-8")
+        print(f"created {notify.SETTINGS.name} with the default sounds (change them with: python sounds.py)")
     hooks, script = s.setdefault("hooks", {}), (notify.HERE / "notify.py").as_posix()
     for ev in ["UserPromptSubmit", *EVENTS]:
         keep = [g for g in hooks.get(ev, []) if not any("notify.py" in (h.get("command") or "")
@@ -82,6 +95,14 @@ def install(path: Path = Path.home() / ".claude" / "settings.json") -> None:
         if ev != "UserPromptSubmit":
             hook["async"] = True
         hooks[ev] = keep + [{"hooks": [hook]}]
+    # The status line: ours is replaced (so a moved folder is fixed), anyone else's is left alone.
+    status = (notify.HERE / "statusline.ps1").as_posix()
+    current = (s.get("statusLine") or {}).get("command") or ""
+    if not current or "statusline.ps1" in current:
+        s["statusLine"] = {"type": "command", "command": f"powershell -NoProfile -File {status}", "padding": 1}
+        print(f"status line now runs {status}")
+    else:
+        print(f"kept your existing status line ({current[:60]}); to use this one instead, point it at {status}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(s, indent=2) + "\n", encoding="utf-8")
     print(f"hooks in {path} now call {script}; restart Claude Code to pick them up")
