@@ -1161,9 +1161,101 @@ class Card(Static):
         self.app.open_detail(self.key)
 
 
+def drag_target(window: tuple, grab: tuple, mouse: tuple) -> tuple:
+    """Where the window goes: it moves exactly as far as the mouse has since the grab."""
+    return window[0] + mouse[0] - grab[0], window[1] + mouse[1] - grab[1]
+
+
+def is_click(press: tuple, release: tuple, slop: int = 4) -> bool:
+    """A press and release this close together is a click, not a drag."""
+    return abs(release[0] - press[0]) <= slop and abs(release[1] - press[1]) <= slop
+
+
+class WindowMover:
+    """Finds the Windows Terminal window this program runs in and moves it.
+
+    In focus mode the terminal has no title bar, so the top bar has to do its
+    job. The console window Windows hands this process is owned by the
+    terminal's real window (class CASCADIA_HOSTING_WINDOW_CLASS), which is what
+    gets moved. Everything is a no-op off Windows or outside Windows Terminal.
+    """
+
+    def __init__(self) -> None:
+        self.hwnd = None
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            self._wt = wintypes
+            self._u32 = ctypes.WinDLL("user32", use_last_error=True)
+            self._ct = ctypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.GetConsoleWindow.restype = wintypes.HWND
+            self._u32.GetAncestor.restype = wintypes.HWND
+            self._u32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+            console = k32.GetConsoleWindow()
+            root = self._u32.GetAncestor(console, 3) if console else None   # GA_ROOTOWNER
+            name = ctypes.create_unicode_buffer(64)
+            if root and self._u32.GetClassNameW(root, name, 64) and \
+                    name.value == "CASCADIA_HOSTING_WINDOW_CLASS":
+                self.hwnd = root
+        except Exception:
+            self.hwnd = None
+
+    def mouse(self) -> tuple:
+        pt = self._wt.POINT()
+        self._u32.GetCursorPos(self._ct.byref(pt))
+        return pt.x, pt.y
+
+    def button_down(self) -> bool:
+        return bool(self._u32.GetAsyncKeyState(0x01) & 0x8000)     # VK_LBUTTON
+
+    def position(self) -> tuple:
+        r = self._wt.RECT()
+        self._u32.GetWindowRect(self.hwnd, self._ct.byref(r))
+        return r.left, r.top
+
+    def move_to(self, x: int, y: int) -> None:
+        # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+        self._u32.SetWindowPos(self.hwnd, None, int(x), int(y), 0, 0, 0x0001 | 0x0004 | 0x0010)
+
+
 class TopBar(Static):
+    """Doubles as the title bar: drag it to move the window, click it for Health.
+
+    While the button is held the real mouse position is polled (~60 Hz) rather
+    than waiting for terminal mouse events: the window moves under the cursor,
+    so the cursor barely moves relative to it and the terminal stops reporting."""
+
+    def on_mount(self) -> None:
+        self._grab = None
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        mover = self.app.mover
+        if event.button != 1 or mover.hwnd is None:
+            return
+        self._grab = (mover.position(), mover.mouse())
+        self._dragging = False
+        self._timer = self.set_interval(1 / 60, self._follow)
+
+    def _follow(self) -> None:
+        mover = self.app.mover
+        window, grab = self._grab
+        mouse = mover.mouse()
+        if mover.button_down():
+            self._dragging = self._dragging or not is_click(grab, mouse)
+            if self._dragging:
+                mover.move_to(*drag_target(window, grab, mouse))
+            return
+        self._timer.stop()                                  # released
+        self._grab = None
+        if not self._dragging:
+            self.app.open_detail("health")
+
     def on_click(self, event: events.Click) -> None:
-        self.app.open_detail("health")
+        if self.app.mover.hwnd is None:                     # no dragging here: plain click
+            self.app.open_detail("health")
 
 
 class Overview(Screen):
@@ -1460,6 +1552,7 @@ class Belt(App):
     def __init__(self, sampler: Sampler, mini: bool = False) -> None:
         super().__init__()
         self.sampler = sampler
+        self.mover = WindowMover()          # lets the top bar drag a title-bar-less window
         self.forced_mode = "mini" if mini else None
         self.update_info: update_check.UpdateInfo | None = None
         self.update_checked_at: datetime | None = None

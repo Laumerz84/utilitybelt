@@ -26,7 +26,9 @@ Three levels of detail:
   window is under 90 columns or 16 rows; `m` toggles it at any size.
 - **Standard** — eight cards, each leading with one number and a 5-minute
   graph that fills the card's spare height. A top bar lists what needs
-  attention (click it, or press `h`, for the health view).
+  attention (click it, or press `h`, for the health view). It is also the
+  title bar: drag it to move the window, which is what makes the borderless
+  Windows Terminal focus mode (`wt --focus`) usable.
 - **Detail** — click a card or press its number. Escape goes back, `q` quits.
 
 Colour means severity only: grey is normal, yellow worth a look, red needs
