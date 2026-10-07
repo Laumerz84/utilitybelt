@@ -28,7 +28,11 @@ Three levels of detail:
   graph that fills the card's spare height. A top bar lists what needs
   attention (click it, or press `h`, for the health view). It is also the
   title bar: drag it to move the window, which is what makes the borderless
-  Windows Terminal focus mode (`wt --focus`) usable.
+  Windows Terminal focus mode (`wt --focus`) usable. While the mouse is over
+  it, three buttons appear at its right end: `▾` small mode (the strip, in a
+  small window in the screen's top-left corner), `–` minimize, `×` close. In
+  small mode the strip can be dragged too, and its `▴` puts the window back
+  where and as big as it was. `m` does the same as `▾` / `▴`.
 - **Detail** — click a card or press its number. Escape goes back, `q` quits.
 
 Colour means severity only: grey is normal, yellow worth a look, red needs

@@ -1171,6 +1171,34 @@ def is_click(press: tuple, release: tuple, slop: int = 4) -> bool:
     return abs(release[0] - press[0]) <= slop and abs(release[1] - press[1]) <= slop
 
 
+BAR_BUTTONS_FULL = (("▾", "small"), ("–", "minimize"), ("×", "close"))
+BAR_BUTTONS_SMALL = (("▴", "full"), ("–", "minimize"), ("×", "close"))
+SMALL_COLS, SMALL_ROWS = 112, 4         # the small strip's window, in terminal cells
+
+
+def button_strip(buttons) -> str:
+    """The buttons as drawn at the very end of a bar line, two spaces apart."""
+    return "  ".join(mark for mark, _ in buttons)
+
+
+def button_at(x: int, width: int, buttons):
+    """Which button (its action) column x of a `width`-wide line lands on, if any.
+    Uses the same layout as button_strip, so drawing and clicking agree."""
+    strip = button_strip(buttons)
+    i = x - (width - len(strip))
+    if 0 <= i < len(strip) and strip[i] != " ":
+        return buttons[i // 3][1]
+    return None
+
+
+def small_rect(cell: tuple, edges: tuple, corner: tuple,
+               cols: int = SMALL_COLS, rows: int = SMALL_ROWS) -> tuple:
+    """(x, y, w, h) for the small strip: `cols` x `rows` cells of the current
+    size, plus the window's own edges, in the work area's top-left corner."""
+    return (corner[0], corner[1],
+            round(cols * cell[0]) + edges[0], round(rows * cell[1]) + edges[1])
+
+
 class WindowMover:
     """Finds the Windows Terminal window this program runs in and moves it.
 
@@ -1220,20 +1248,91 @@ class WindowMover:
         # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
         self._u32.SetWindowPos(self.hwnd, None, int(x), int(y), 0, 0, 0x0001 | 0x0004 | 0x0010)
 
+    def rect(self) -> tuple:
+        r = self._wt.RECT()
+        self._u32.GetWindowRect(self.hwnd, self._ct.byref(r))
+        return r.left, r.top, r.right - r.left, r.bottom - r.top
 
-class TopBar(Static):
-    """Doubles as the title bar: drag it to move the window, click it for Health.
+    def client_size(self) -> tuple:
+        r = self._wt.RECT()
+        self._u32.GetClientRect(self.hwnd, self._ct.byref(r))
+        return r.right - r.left, r.bottom - r.top
 
-    While the button is held the real mouse position is polled (~60 Hz) rather
-    than waiting for terminal mouse events: the window moves under the cursor,
-    so the cursor barely moves relative to it and the terminal stops reporting."""
+    def set_rect(self, x: int, y: int, w: int, h: int) -> None:
+        # SWP_NOZORDER | SWP_NOACTIVATE
+        self._u32.SetWindowPos(self.hwnd, None, int(x), int(y), int(w), int(h), 0x0004 | 0x0010)
+
+    def work_corner(self) -> tuple:
+        """Top-left of the usable area (taskbar excluded) of this window's monitor."""
+        ct, wt = self._ct, self._wt
+
+        class MonitorInfo(ct.Structure):
+            _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
+                        ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+
+        self._u32.MonitorFromWindow.restype = wt.HANDLE
+        mon = self._u32.MonitorFromWindow(self.hwnd, 2)          # MONITOR_DEFAULTTONEAREST
+        info = MonitorInfo()
+        info.cbSize = ct.sizeof(MonitorInfo)
+        if mon and self._u32.GetMonitorInfoW(wt.HANDLE(mon), ct.byref(info)):
+            return info.rcWork.left, info.rcWork.top
+        return 0, 0
+
+    def minimize(self) -> None:
+        self._u32.ShowWindow(self.hwnd, 6)                       # SW_MINIMIZE
+
+
+class DragBar(Static):
+    """A bar that stands in for the missing title bar: drag it to move the
+    window, and while the mouse is over it, buttons appear at the right end of
+    its last line.
+
+    While the mouse button is held the real mouse position is polled (~60 Hz)
+    rather than waiting for terminal mouse events: the window moves under the
+    cursor, so the cursor barely moves relative to it and the terminal stops
+    reporting."""
+
+    BUTTONS = BAR_BUTTONS_FULL
+    BUTTON_ROW = 0                                         # the text line the buttons are drawn on
 
     def on_mount(self) -> None:
         self._grab = None
+        self.hover = False
+        self.hot = None                                    # the button under the mouse
+
+    def _button(self, event):
+        """The button action under the mouse, if the event is on a button."""
+        off = event.get_content_offset(self)
+        if off is None or off.y != self.BUTTON_ROW:
+            return None
+        return button_at(off.x, self.content_size.width, self.BUTTONS)
+
+    def _refresh(self) -> None:
+        screen = self.screen
+        if isinstance(screen, Overview):
+            screen.redraw()
+
+    def on_enter(self, event: events.Enter) -> None:
+        self.hover = True
+        self._refresh()
+
+    def on_leave(self, event: events.Leave) -> None:
+        self.hover, self.hot = False, None
+        self._refresh()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        hot = self._button(event)
+        if hot != self.hot:
+            self.hot = hot
+            self._refresh()
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
+        if event.button != 1:
+            return
+        if self._button(event):                            # buttons act on the click (release),
+            return                                          # not here: see on_click
         mover = self.app.mover
-        if event.button != 1 or mover.hwnd is None:
+        if mover.hwnd is None:
             return
         self._grab = (mover.position(), mover.mouse())
         self._dragging = False
@@ -1251,11 +1350,35 @@ class TopBar(Static):
         self._timer.stop()                                  # released
         self._grab = None
         if not self._dragging:
-            self.app.open_detail("health")
+            self.on_plain_click()
 
     def on_click(self, event: events.Click) -> None:
-        if self.app.mover.hwnd is None:                     # no dragging here: plain click
-            self.app.open_detail("health")
+        # Buttons act on release: acting on press changes the layout under the
+        # mouse, and the release then lands on (and clicks) whatever moved there.
+        action = self._button(event)
+        if action:
+            self.app.bar_action(action)
+        elif self.app.mover.hwnd is None:
+            self.on_plain_click()                           # no dragging here: plain click
+
+    def on_plain_click(self) -> None:
+        pass
+
+
+class TopBar(DragBar):
+    """The standard view's top line: drag to move, click for Health."""
+
+    BUTTONS = BAR_BUTTONS_FULL
+
+    def on_plain_click(self) -> None:
+        self.app.open_detail("health")
+
+
+class MiniStrip(DragBar):
+    """The small strip: drag anywhere to move; buttons on its last line."""
+
+    BUTTONS = BAR_BUTTONS_SMALL
+    BUTTON_ROW = 2                                         # third line, after the clock
 
 
 class Overview(Screen):
@@ -1271,7 +1394,7 @@ class Overview(Screen):
             for i, (key, title) in enumerate(self.CARDS, start=1):
                 yield Card(key, title, i)
         yield Static(id="hint")
-        yield Static(id="mini")
+        yield MiniStrip(id="mini")
 
     def on_mount(self) -> None:
         self.set_interval(1.0, self.redraw)
@@ -1300,9 +1423,11 @@ class Overview(Screen):
         snap = app.sampler.read()
         alerts = compute_alerts(snap, app.sampler)
         if self.is_mini():
-            self.query_one("#mini", Static).update(app.render_mini(snap, alerts, self.size.width - 2))
+            strip = self.query_one("#mini", MiniStrip)
+            strip.update(app.render_mini(snap, alerts, self.size.width - 2, bar=strip))
             return
-        self.query_one("#topbar", TopBar).update(app.render_topbar(alerts, self.size.width - 4))
+        bar = self.query_one("#topbar", TopBar)
+        bar.update(app.render_topbar(alerts, self.size.width - 4, bar=bar))
         for key, _ in self.CARDS:
             try:
                 card = self.query_one(f"#card-{key}", Card)
@@ -1598,9 +1723,35 @@ class Belt(App):
             self.pop_screen()
         overview = self.screen
         if isinstance(overview, Overview):
-            self.forced_mode = "full" if overview.is_mini() else "mini"
-            overview.apply_mode()
-            overview.redraw()
+            self.set_small(not overview.is_mini())
+
+    def set_small(self, small: bool) -> None:
+        """Small mode: the strip view in a small window in the screen's top-left
+        corner. Leaving it puts the window back where and as big as it was."""
+        mover = self.mover
+        if mover.hwnd is not None:
+            x, y, w, h = mover.rect()
+            cw, ch = mover.client_size()
+            cell = (cw / max(1, self.size.width), ch / max(1, self.size.height))
+            if small:
+                self._full_rect = (x, y, w, h)
+                mover.set_rect(*small_rect(cell, (w - cw, h - ch), mover.work_corner()))
+            elif getattr(self, "_full_rect", None):
+                mover.set_rect(*self._full_rect)
+            else:                                           # started small: grow to a standard size
+                mover.set_rect(x, y, round(150 * cell[0]) + w - cw, round(42 * cell[1]) + h - ch)
+        self.forced_mode = "mini" if small else "full"
+        if isinstance(self.screen, Overview):
+            self.screen.apply_mode()
+            self.screen.redraw()
+
+    def bar_action(self, action: str) -> None:
+        if action in ("small", "full"):
+            self.set_small(action == "small")
+        elif action == "minimize" and self.mover.hwnd is not None:
+            self.mover.minimize()
+        elif action == "close":
+            self.exit()
 
     def open_detail(self, key: str) -> None:
         while isinstance(self.screen, Detail):
@@ -1755,11 +1906,19 @@ class Belt(App):
         l.append_text(r)
         return l
 
-    def render_topbar(self, alerts: list[dict], width: int) -> Text:
-        return self._line(f"[bold]UtilityBelt[/]   {self._alert_text(alerts)}",
-                          f"[dim]{datetime.now():%H:%M:%S}[/]", width)
+    @staticmethod
+    def _buttons(bar) -> str:
+        """The hover buttons as markup, or nothing when the mouse is elsewhere."""
+        if bar is None or not getattr(bar, "hover", False):
+            return ""
+        marks = [f"[bold]{m}[/]" if a == bar.hot else f"[dim]{m}[/]" for m, a in bar.BUTTONS]
+        return "   " + "  ".join(marks)
 
-    def render_mini(self, snap: dict, alerts: list[dict], width: int) -> Text:
+    def render_topbar(self, alerts: list[dict], width: int, bar=None) -> Text:
+        return self._line(f"[bold]UtilityBelt[/]   {self._alert_text(alerts)}",
+                          f"[dim]{datetime.now():%H:%M:%S}[/]{self._buttons(bar)}", width)
+
+    def render_mini(self, snap: dict, alerts: list[dict], width: int, bar=None) -> Text:
         s = self.sampler
         vtotal = snap.get("vram_total") or 0
         vpct = (snap.get("vram_used") or 0) / vtotal * 100 if vtotal else 0
@@ -1793,7 +1952,7 @@ class Belt(App):
             self._line(line1, "", width),
             self._line(line2, "", width),
             self._line(self._alert_text(alerts, limit=3),
-                       f"{update}[dim]{datetime.now():%H:%M}[/]", width),
+                       f"{update}[dim]{datetime.now():%H:%M}[/]{self._buttons(bar)}", width),
         ])
 
     @staticmethod
