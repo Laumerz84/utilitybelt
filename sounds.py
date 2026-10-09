@@ -20,6 +20,7 @@ import notify
 EVENTS = {"Stop": "Claude finished a turn", "Notification": "Claude needs you",
           "PostToolUseFailure": "a tool failed", "PermissionDenied": "permission refused",
           "SubagentStop": "a subagent finished", "PreCompact": "context compacted"}
+MUTE_WORDS = {"chat": "for the chat you are in", "app": "while Claude is in front", "never": "never"}
 
 
 def wavs() -> list:
@@ -41,7 +42,7 @@ def menu() -> None:
         for i, ev in enumerate(rows, 1):
             print(f" {i}. {EVENTS[ev]:<24} {cfg['events'].get(ev) or 'off'}")
         print(f" 7. quiet for turns shorter than   {cfg['quiet_under_seconds']:g} s")
-        print(f" 8. silent while Claude is in front {'yes' if cfg['mute_when_claude_focused'] else 'no'}")
+        print(f" 8. silent when you are looking    {MUTE_WORDS.get(cfg['mute'], cfg['mute'])}")
         print(f" 9. volume on this computer        {cfg['volume']:g}  (1 = as made, up to 4)")
         c = input("\n number to change, p<number> to hear one, s to save, q to quit: ").strip().lower()
         if c == "q":
@@ -66,8 +67,10 @@ def menu() -> None:
         elif c == "7":
             got = input("   seconds: ").strip()
             cfg["quiet_under_seconds"] = float(got) if got.replace(".", "", 1).isdigit() else cfg["quiet_under_seconds"]
-        elif c == "8":
-            cfg["mute_when_claude_focused"] = not cfg["mute_when_claude_focused"]
+        elif c == "8":           # for the chat you are in -> while Claude is in front -> never -> ...
+            modes = notify.MUTE_MODES
+            cfg["mute"] = modes[(modes.index(cfg["mute"]) + 1) % len(modes)] if cfg["mute"] in modes else modes[0]
+            cfg["mute_when_claude_focused"] = cfg["mute"] != "never"   # what older copies of notify.py read
 
 
 def install(path: Path = Path.home() / ".claude" / "settings.json") -> None:

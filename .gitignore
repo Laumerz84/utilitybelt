@@ -17,5 +17,6 @@ Thumbs.db
 .env
 .env.*
 .turn-start
+.turn-starts.json*
 sounds.local.json
 .tmp-tests/
