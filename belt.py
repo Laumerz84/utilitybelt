@@ -1313,6 +1313,18 @@ class WindowMover:
     def minimize(self) -> None:
         self._u32.ShowWindow(self.hwnd, 6)                       # SW_MINIMIZE
 
+    def shadow(self, on: bool) -> None:
+        """Windows draws a drop shadow below the window even when the window
+        itself is slid up off screen. Switching off its non-client rendering
+        (DWMWA_NCRENDERING_POLICY = disabled) removes the shadow; "use window
+        style" puts it back."""
+        value = self._ct.c_int(0 if on else 1)
+        try:
+            self._ct.windll.dwmapi.DwmSetWindowAttribute(
+                self._wt.HWND(self.hwnd), 2, self._ct.byref(value), 4)
+        except Exception:
+            pass
+
 
 class DragBar(Static):
     """A bar that stands in for the missing title bar: drag it to move the
@@ -1782,6 +1794,7 @@ class Belt(App):
             else:
                 self._stop_autohide()
                 mover.topmost(False)
+                mover.shadow(True)
                 if getattr(self, "_full_rect", None):
                     mover.set_rect(*self._full_rect)
                 else:                                       # started small: grow to a standard size
@@ -1828,12 +1841,16 @@ class Belt(App):
         x, y, _, _ = self.mover.rect()
         steps = slide_steps(y, target_y)
         self._sliding, self._shown, self._away_since = True, shown, None
+        if shown:
+            self.mover.shadow(True)                         # back before it comes into view
 
         def step() -> None:
             self.mover.move_to(x, steps.pop(0))
             if not steps:
                 timer.stop()
                 self._sliding = False
+                if not shown:
+                    self.mover.shadow(False)                # hidden: no shadow left on screen
 
         timer = self.set_interval(0.025, step)
 
@@ -1844,6 +1861,7 @@ class Belt(App):
             return
         x, y, _, _ = self.mover.rect()
         self._docked = docks(y, self._dock_top)
+        self.mover.shadow(True)
         if self._docked:
             self.mover.move_to(x, self._dock_top)
             self._shown, self._away_since = True, None
