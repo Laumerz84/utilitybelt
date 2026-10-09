@@ -68,6 +68,7 @@ from textual.screen import Screen
 from textual.widgets import Static
 
 import agentlog
+import gpusensors
 import update_check
 
 
@@ -421,6 +422,8 @@ class Sampler:
         self.mem = Series()
         self.gpu = Series()
         self.vram = Series()
+        self.gpu_temp = Series()                  # edge temperature, C (AMD cards via ADL)
+        self.gpu_power = Series()                 # W
         self.net_up = Series()
         self.net_down = Series()
         self.disk_read = Series()
@@ -473,7 +476,17 @@ class Sampler:
     # -- fast: every second, cheap counters only
     def _fast_loop(self) -> None:
         psutil.cpu_percent(percpu=True)          # prime; first call is garbage
+        adl = gpusensors.AdlReader()             # AMD temperature/fan/power; .ok False elsewhere
+        tick = 0
         while not self.stop.wait(1.0):
+            tick += 1
+            if adl.ok and tick % 2 == 0:         # every 2 s; a read takes ~0.3 ms
+                reading = adl.read()
+                with self.lock:
+                    self.snap["gpu_sensors"] = reading
+                    if reading:
+                        self.gpu_temp.push(reading["edge"] or 0)
+                        self.gpu_power.push(reading["power"] or 0)
             try:
                 cores = psutil.cpu_percent(percpu=True)
                 vm = psutil.virtual_memory()
@@ -1142,6 +1155,19 @@ def compute_alerts(snap: dict, s: Sampler) -> list[dict]:
         add(WARN, f"{len(left)} leftover process{'es' if len(left) > 1 else ''}",
             f"{len(left)} script process(es) are still running although whatever "
             f"started them has closed. Details under h.")
+
+    sensors = snap.get("gpu_sensors")
+    if sensors:
+        lvl = gpusensors.heat_level(sensors)
+        if lvl != OK:
+            name, value = max(((n, sensors.get(n)) for n in gpusensors.LIMITS if sensors.get(n) is not None),
+                              key=lambda nv: nv[1] - gpusensors.LIMITS[nv[0]][0])
+            what = {"hotspot": "GPU hotspot", "edge": "GPU", "memory": "GPU memory"}[name]
+            add(lvl, f"{what} {value}°C",
+                f"The graphics card's {what.replace('GPU ', '').replace('GPU', 'core')} temperature is "
+                f"{value} °C (hotspot {sensors.get('hotspot')} °C, memory {sensors.get('memory')} °C, "
+                f"fan {sensors.get('fan_pct')}%). AMD cards slow themselves down around 110 °C hotspot; "
+                f"check the card's airflow and dust if this stays high.")
 
     out.sort(key=lambda a: a["lvl"] != CRIT)
     return out
@@ -2051,7 +2077,7 @@ class Belt(App):
 
         parts = [
             f"CPU [{NUM[cpu_l]}]{s.cpu.now:3.0f}%[/] {chart(s.cpu.points, spark_w, lvl=cpu_l)[0]}",
-            f"GPU [bold]{s.gpu.now:3.0f}%[/] {chart(s.gpu.points, spark_w)[0]}",
+            f"GPU [bold]{s.gpu.now:3.0f}%[/]{self._gpu_temp(snap)} {chart(s.gpu.points, spark_w)[0]}",
             f"VRAM [{NUM[v_l]}]{vpct:.0f}%[/]",
             f"MEM [{NUM[m_l]}]{vm.percent if vm else 0:.0f}%[/]",
         ]
@@ -2133,7 +2159,13 @@ class Belt(App):
             return ["[dim]waiting for counters…[/]"], OK
         vpct = used / total * 100 if total else 0
         v_l = level(vpct, 90, 97)
-        lines = [f"[bold]{s.gpu.now:.0f}%[/] [dim]load[/]   VRAM [{NUM[v_l]}]{vpct:.0f}%[/]"]
+        sensors = snap.get("gpu_sensors")
+        heat = ""
+        if sensors:
+            fan = f"  [dim]fan {sensors['fan_pct']}%[/]" if sensors.get("fan_pct") is not None else ""
+            heat = f" {self._gpu_temp(snap)}{fan}"
+            v_l = worst(v_l, gpusensors.heat_level(sensors))
+        lines = [f"[bold]{s.gpu.now:.0f}%[/] [dim]load[/]   VRAM [{NUM[level(vpct, 90, 97)]}]{vpct:.0f}%[/]{heat}"]
         lines += chart(s.gpu.points, w, self._graph_rows(h, 2))
         ol = snap.get("ollama")
         if ol is None:
@@ -2147,6 +2179,14 @@ class Belt(App):
         else:
             lines.append("[dim]Ollama idle · no model loaded[/]")
         return lines, v_l
+
+    @staticmethod
+    def _gpu_temp(snap) -> str:
+        """' 63°C' coloured by the card's worst temperature, or '' without sensors."""
+        sensors = snap.get("gpu_sensors")
+        if not sensors or sensors.get("edge") is None:
+            return ""
+        return f" [{NUM[gpusensors.heat_level(sensors)]}]{sensors['edge']}°C[/]"
 
     def _card_storage(self, snap, s, w, h):
         disks = snap.get("disks") or []
@@ -2373,8 +2413,30 @@ class Belt(App):
         for g in gpus:
             out += ["", f"[dim]{escape(g.get('name') or '')} · driver {g.get('driver')} "
                     f"({g.get('date')})[/]"]
-        out += ["[dim]Temperature, fan speed and power need LibreHardwareMonitor — "
-                "coming in the sensors step.[/]"]
+        sensors = snap.get("gpu_sensors")
+        if sensors:
+            lvl = gpusensors.heat_level(sensors)
+
+            def val(key, unit, fmt="{}"):
+                v = sensors.get(key)
+                return "—" if v is None else fmt.format(v) + unit
+
+            out += ["", f"[bold]sensors[/]  [dim]from AMD's driver (ADL), every 2 s[/]",
+                    f"  temperature  [{NUM[lvl]}]{val('edge', ' °C')}[/]  "
+                    f"[dim]hotspot {val('hotspot', ' °C')} · memory {val('memory', ' °C')} · "
+                    f"slows itself down around 110 °C hotspot[/]",
+                    f"  fan          {val('fan_pct', '%')}  [dim]{val('fan_rpm', ' RPM')}[/]",
+                    f"  power        {val('power', ' W')}",
+                    f"  clocks       {val('core_clock', ' MHz')} core  [dim]· {val('mem_clock', ' MHz')} memory · "
+                    f"{val('voltage', ' V', '{:.3f}')}[/]",
+                    "", "[bold]temperature[/]"]
+            out += self._graph(s.gpu_temp.points, width, top=max(100.0, s.gpu_temp.peak), label="°C, 0-100")
+            out += ["", "[bold]power[/]"]
+            out += self._graph(s.gpu_power.points, width, top=max(50.0, s.gpu_power.peak),
+                               label=f"W, peak {s.gpu_power.peak:.0f}")
+        else:
+            out += ["[dim]No temperature or fan readings: these come from AMD's driver, and this "
+                    "card isn't an AMD one (see NVIDIA-SETUP.md for NVIDIA cards).[/]"]
         return "\n".join(out)
 
     def _detail_storage(self, snap, s, width) -> str:
@@ -2606,6 +2668,7 @@ def probe() -> int:
     running, rated = ram_speed(snap)
     print(f"ram speed    {running} MT/s, rated {rated or '?'}")
     print(f"gpu          {sampler.gpu.now:.1f}%  engines={list((snap.get('gpu_types') or {}).keys())}")
+    print(f"gpu sensors  {snap.get('gpu_sensors')}")
     print(f"vram         {human_bytes(snap.get('vram_used') or 0)} / "
           f"{human_bytes(snap.get('vram_total') or 0)}")
     ol = snap.get("ollama") or {}

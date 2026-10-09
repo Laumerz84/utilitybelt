@@ -47,7 +47,7 @@ Lines never wrap — they end in an ellipsis.
 | --- | --- |
 | CPU | 5-minute graph, every thread, frequency, context switches and interrupts per second, uptime, top processes |
 | Memory | 5-minute graph, breakdown, each RAM module with its running speed against the rated speed in its part number (catches EXPO being off), top processes |
-| GPU | load and VRAM graphs, what Ollama has loaded and when it unloads, per-engine split, driver version |
+| GPU | load and VRAM graphs; on AMD cards temperature (edge, hotspot, memory), fan, power, clocks and voltage with temperature and power graphs; what Ollama has loaded and when it unloads; per-engine split; driver version |
 | Storage | read/write graph, per-volume capacity, lifetime bytes and op counts per device |
 | Network | download and upload graphs, Tailscale, per-interface totals, errors, sockets |
 | Claude | which chats are working, waiting on you, or probably stuck on a permission prompt; per-model token and cost table |
@@ -69,7 +69,8 @@ alongside capacity, and per-process attribution.
 frame, so one PowerShell process is started at launch and streams a JSON line
 per second that a reader thread consumes. The upside is the per-engine
 breakdown; the cost is that temperature, fan speed and power draw are not
-available from Windows. LibreHardwareMonitor can supply them (planned).
+available from Windows. On AMD cards `gpusensors.py` reads them from the driver's own ADL library
+(`atiadlxx.dll`) every 2 seconds - no admin rights, nothing to install. NVIDIA cards: see `NVIDIA-SETUP.md`.
 
 Slower facts come from a fourth thread: Ollama's `/api/ps` every 5 s, the
 event log every 5 minutes (about 0.3 s, no admin needed), and RAM, board, BIOS
