@@ -29,10 +29,14 @@ Three levels of detail:
   attention (click it, or press `h`, for the health view). It is also the
   title bar: drag it to move the window, which is what makes the borderless
   Windows Terminal focus mode (`wt --focus`) usable. While the mouse is over
-  it, three buttons appear at its right end: `▾` small mode (the strip, in a
-  small window in the screen's top-left corner), `–` minimize, `×` close. In
-  small mode the strip can be dragged too, and its `▴` puts the window back
-  where and as big as it was. `m` does the same as `▾` / `▴`.
+  it, three buttons appear at its right end: `▾` small mode, `–` minimize,
+  `×` close. Small mode is the strip in a narrow always-on-top window at the
+  top centre of the screen that slides up out of sight (leaving a 4 px sliver)
+  half a second after the mouse leaves it, and slides down when the mouse
+  reaches the sliver, like Zoom's meeting controls. Drag the strip down to
+  park it somewhere else (it then stays visible); drop it near the top edge to
+  dock it again. Its `▴` puts the window back where and as big as it was. `m`
+  does the same as `▾` / `▴`.
 - **Detail** — click a card or press its number. Escape goes back, `q` quits.
 
 Colour means severity only: grey is normal, yellow worth a look, red needs

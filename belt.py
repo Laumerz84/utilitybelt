@@ -1173,7 +1173,9 @@ def is_click(press: tuple, release: tuple, slop: int = 4) -> bool:
 
 BAR_BUTTONS_FULL = (("▾", "small"), ("–", "minimize"), ("×", "close"))
 BAR_BUTTONS_SMALL = (("▴", "full"), ("–", "minimize"), ("×", "close"))
-SMALL_COLS, SMALL_ROWS = 112, 4         # the small strip's window, in terminal cells
+SMALL_COLS, SMALL_ROWS = 88, 4          # the small strip's window, in terminal cells
+PEEK = 4                                # px of a hidden strip left showing at the top edge
+HIDE_AFTER = 0.5                        # s the mouse must be away before it slides up
 
 
 def button_strip(buttons) -> str:
@@ -1191,12 +1193,36 @@ def button_at(x: int, width: int, buttons):
     return None
 
 
-def small_rect(cell: tuple, edges: tuple, corner: tuple,
+def small_rect(cell: tuple, edges: tuple, area: tuple,
                cols: int = SMALL_COLS, rows: int = SMALL_ROWS) -> tuple:
     """(x, y, w, h) for the small strip: `cols` x `rows` cells of the current
-    size, plus the window's own edges, in the work area's top-left corner."""
-    return (corner[0], corner[1],
-            round(cols * cell[0]) + edges[0], round(rows * cell[1]) + edges[1])
+    size plus the window's own edges, at the top centre of the work area
+    (left, top, right, bottom), like Zoom's meeting controls."""
+    w = round(cols * cell[0]) + edges[0]
+    h = round(rows * cell[1]) + edges[1]
+    left, top, right, _ = area
+    return left + (right - left - w) // 2, top, w, h
+
+
+def hidden_y(top: int, height: int, peek: int = PEEK) -> int:
+    """Window y when slid up out of sight, leaving `peek` px at the top edge."""
+    return top - height + peek
+
+
+def slide_steps(start: int, end: int, n: int = 6) -> list:
+    """The y positions of a short ease-out slide from start to end."""
+    return [round(start + (end - start) * (1 - (1 - i / n) ** 2)) for i in range(1, n + 1)]
+
+
+def docks(y: int, top: int, snap: int = 24) -> bool:
+    """A strip dropped this close to the top edge docks there (and hides)."""
+    return y - top <= snap
+
+
+def wants_open(mouse: tuple, left: int, width: int, top: int,
+               peek: int = PEEK, slack: int = 2) -> bool:
+    """Is the mouse on the sliver a hidden strip leaves at the top edge?"""
+    return left <= mouse[0] < left + width and top - slack <= mouse[1] <= top + peek + slack
 
 
 class WindowMover:
@@ -1262,8 +1288,8 @@ class WindowMover:
         # SWP_NOZORDER | SWP_NOACTIVATE
         self._u32.SetWindowPos(self.hwnd, None, int(x), int(y), int(w), int(h), 0x0004 | 0x0010)
 
-    def work_corner(self) -> tuple:
-        """Top-left of the usable area (taskbar excluded) of this window's monitor."""
+    def work_area(self) -> tuple:
+        """(left, top, right, bottom) of the usable area (taskbar excluded) of this window's monitor."""
         ct, wt = self._ct, self._wt
 
         class MonitorInfo(ct.Structure):
@@ -1275,8 +1301,14 @@ class WindowMover:
         info = MonitorInfo()
         info.cbSize = ct.sizeof(MonitorInfo)
         if mon and self._u32.GetMonitorInfoW(wt.HANDLE(mon), ct.byref(info)):
-            return info.rcWork.left, info.rcWork.top
-        return 0, 0
+            r = info.rcWork
+            return r.left, r.top, r.right, r.bottom
+        return 0, 0, 1920, 1040
+
+    def topmost(self, on: bool) -> None:
+        # HWND_TOPMOST / HWND_NOTOPMOST; SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+        self._u32.SetWindowPos(self.hwnd, self._wt.HWND(-1 if on else -2), 0, 0, 0, 0,
+                               0x0002 | 0x0001 | 0x0010)
 
     def minimize(self) -> None:
         self._u32.ShowWindow(self.hwnd, 6)                       # SW_MINIMIZE
@@ -1349,7 +1381,9 @@ class DragBar(Static):
             return
         self._timer.stop()                                  # released
         self._grab = None
-        if not self._dragging:
+        if self._dragging:
+            self.on_drag_end()
+        else:
             self.on_plain_click()
 
     def on_click(self, event: events.Click) -> None:
@@ -1362,6 +1396,9 @@ class DragBar(Static):
             self.on_plain_click()                           # no dragging here: plain click
 
     def on_plain_click(self) -> None:
+        pass
+
+    def on_drag_end(self) -> None:
         pass
 
 
@@ -1379,6 +1416,9 @@ class MiniStrip(DragBar):
 
     BUTTONS = BAR_BUTTONS_SMALL
     BUTTON_ROW = 2                                         # third line, after the clock
+
+    def on_drag_end(self) -> None:
+        self.app.strip_dropped()
 
 
 class Overview(Screen):
@@ -1735,15 +1775,78 @@ class Belt(App):
             cell = (cw / max(1, self.size.width), ch / max(1, self.size.height))
             if small:
                 self._full_rect = (x, y, w, h)
-                mover.set_rect(*small_rect(cell, (w - cw, h - ch), mover.work_corner()))
-            elif getattr(self, "_full_rect", None):
-                mover.set_rect(*self._full_rect)
-            else:                                           # started small: grow to a standard size
-                mover.set_rect(x, y, round(150 * cell[0]) + w - cw, round(42 * cell[1]) + h - ch)
+                area = mover.work_area()
+                mover.set_rect(*small_rect(cell, (w - cw, h - ch), area))
+                mover.topmost(True)
+                self._start_autohide(area[1])
+            else:
+                self._stop_autohide()
+                mover.topmost(False)
+                if getattr(self, "_full_rect", None):
+                    mover.set_rect(*self._full_rect)
+                else:                                       # started small: grow to a standard size
+                    mover.set_rect(x, y, round(150 * cell[0]) + w - cw, round(42 * cell[1]) + h - ch)
         self.forced_mode = "mini" if small else "full"
         if isinstance(self.screen, Overview):
             self.screen.apply_mode()
             self.screen.redraw()
+
+    # ---- slide-away small mode: docked at the top edge, the strip slides up out
+    # of sight leaving a thin sliver, and slides down when the mouse reaches it.
+
+    def _start_autohide(self, top: int) -> None:
+        self._dock_top, self._docked, self._shown = top, True, True
+        self._away_since, self._sliding = None, False
+        self._stop_autohide()
+        self._autohide_timer = self.set_interval(0.05, self._autohide)
+
+    def _stop_autohide(self) -> None:
+        timer = getattr(self, "_autohide_timer", None)
+        if timer is not None:
+            timer.stop()
+            self._autohide_timer = None
+
+    def _autohide(self) -> None:
+        mover = self.mover
+        if not self._docked or self._sliding or mover.button_down():
+            return                                          # not docked, mid-slide, or being dragged
+        x, y, w, h = mover.rect()
+        mouse = mover.mouse()
+        if not self._shown:
+            if wants_open(mouse, x, w, self._dock_top):
+                self._slide(self._dock_top, shown=True)
+            return
+        inside = x - 8 <= mouse[0] <= x + w + 8 and y - 8 <= mouse[1] <= y + h + 8
+        if inside:
+            self._away_since = None
+        elif self._away_since is None:
+            self._away_since = time.time()
+        elif time.time() - self._away_since >= HIDE_AFTER:
+            self._slide(hidden_y(self._dock_top, h), shown=False)
+
+    def _slide(self, target_y: int, shown: bool) -> None:
+        x, y, _, _ = self.mover.rect()
+        steps = slide_steps(y, target_y)
+        self._sliding, self._shown, self._away_since = True, shown, None
+
+        def step() -> None:
+            self.mover.move_to(x, steps.pop(0))
+            if not steps:
+                timer.stop()
+                self._sliding = False
+
+        timer = self.set_interval(0.025, step)
+
+    def strip_dropped(self) -> None:
+        """After dragging the strip: near the top edge it docks (and hides when
+        the mouse leaves); anywhere else it stays put and visible."""
+        if self.mover.hwnd is None or getattr(self, "_autohide_timer", None) is None:
+            return
+        x, y, _, _ = self.mover.rect()
+        self._docked = docks(y, self._dock_top)
+        if self._docked:
+            self.mover.move_to(x, self._dock_top)
+            self._shown, self._away_since = True, None
 
     def bar_action(self, action: str) -> None:
         if action in ("small", "full"):

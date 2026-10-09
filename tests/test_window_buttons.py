@@ -45,11 +45,40 @@ class ButtonHits(unittest.TestCase):
 class SmallModeRect(unittest.TestCase):
     def test_sized_for_the_strip_from_the_current_cell_size_plus_window_edges(self):
         # 9x19 px cells, window edges add 16 px across and 8 px down
-        self.assertEqual(belt.small_rect(cell=(9, 19), edges=(16, 8), corner=(0, 0)),
-                         (0, 0, 112 * 9 + 16, 4 * 19 + 8))
+        x, y, w, h = belt.small_rect(cell=(9, 19), edges=(16, 8), area=(0, 0, 1920, 1040))
+        self.assertEqual((w, h), (88 * 9 + 16, 4 * 19 + 8))
 
-    def test_goes_to_the_work_area_corner_not_under_a_top_taskbar(self):
-        self.assertEqual(belt.small_rect(cell=(9, 19), edges=(0, 0), corner=(0, 48))[:2], (0, 48))
+    def test_sits_top_centre_of_the_work_area(self):
+        x, y, w, h = belt.small_rect(cell=(10, 20), edges=(0, 0), area=(0, 0, 1920, 1040))
+        self.assertEqual((x, y), ((1920 - 880) // 2, 0))
+
+    def test_stays_below_a_top_taskbar(self):
+        self.assertEqual(belt.small_rect(cell=(10, 20), edges=(0, 0), area=(0, 48, 1920, 1080))[1], 48)
+
+
+class SlideAway(unittest.TestCase):
+    def test_hidden_leaves_a_thin_sliver_showing_at_the_top_edge(self):
+        self.assertEqual(belt.hidden_y(top=0, height=100), -96)
+
+    def test_slide_ends_exactly_where_it_should(self):
+        steps = belt.slide_steps(-96, 0)
+        self.assertEqual(steps[-1], 0)
+        self.assertTrue(all(a <= b for a, b in zip(steps, steps[1:])))   # never jumps backwards
+
+    def test_slide_is_short(self):
+        self.assertLessEqual(len(belt.slide_steps(-96, 0)), 10)
+
+    def test_dropped_near_the_top_docks_and_hides(self):
+        self.assertTrue(belt.docks(y=10, top=0))
+
+    def test_dropped_lower_down_stays_put_and_visible(self):
+        self.assertFalse(belt.docks(y=200, top=0))
+
+    def test_mouse_in_the_sliver_brings_it_down(self):
+        # window 400..1200 across, hidden so only y 0..4 shows
+        self.assertTrue(belt.wants_open(mouse=(800, 2), left=400, width=800, top=0))
+        self.assertFalse(belt.wants_open(mouse=(800, 40), left=400, width=800, top=0))
+        self.assertFalse(belt.wants_open(mouse=(100, 2), left=400, width=800, top=0))
 
 
 if __name__ == "__main__":
