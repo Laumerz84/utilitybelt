@@ -20,6 +20,7 @@ class FakeWindow:
 
     def __init__(self):
         self.hwnd, self.y, self.calls = 1, 0, []
+        self.shadow_state = True
 
     def rect(self):
         return 500, self.y, 800, 100
@@ -27,8 +28,18 @@ class FakeWindow:
     def move_to(self, x, y):
         self.y = y
 
+    def mouse(self):
+        return (5, 900)                                    # far away: stays hidden
+
+    def button_down(self):
+        return False
+
     def shadow(self, on):
         self.calls.append(("shadow", on))
+        self.shadow_state = on
+
+    def shadow_is_on(self):
+        return self.shadow_state
 
     def topmost(self, on):
         self.calls.append(("topmost", on))
@@ -57,6 +68,17 @@ class SlideShadow(unittest.TestCase):
             app._slide(0, shown=True)
             await pilot.pause(0.05)
             self.assertIn(("shadow", True), app.mover.calls)
+        self.run_app(steps)
+
+    def test_shadow_switched_back_on_by_windows_is_switched_off_again_while_hidden(self):
+        # Windows Terminal redraws its frame after a move and turns the shadow back on.
+        async def steps(app, pilot):
+            app._start_autohide(0)
+            app._slide(-96, shown=False)
+            await pilot.pause(0.4)
+            app.mover.shadow_state = True                  # what Windows Terminal does
+            await pilot.pause(0.3)
+            self.assertFalse(app.mover.shadow_state)
         self.run_app(steps)
 
 

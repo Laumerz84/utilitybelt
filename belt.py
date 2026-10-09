@@ -1351,6 +1351,16 @@ class WindowMover:
         except Exception:
             pass
 
+    def shadow_is_on(self) -> bool:
+        """Whether Windows is drawing the frame (and so the shadow) right now."""
+        value = self._ct.c_int(0)
+        try:
+            self._ct.windll.dwmapi.DwmGetWindowAttribute(
+                self._wt.HWND(self.hwnd), 1, self._ct.byref(value), 4)   # DWMWA_NCRENDERING_ENABLED
+        except Exception:
+            return False
+        return bool(value.value)
+
 
 class DragBar(Static):
     """A bar that stands in for the missing title bar: drag it to move the
@@ -1854,6 +1864,10 @@ class Belt(App):
         if not self._shown:
             if wants_open(mouse, x, w, self._dock_top):
                 self._slide(self._dock_top, shown=True)
+            elif mover.shadow_is_on():
+                # Windows Terminal redraws its frame after a move and turns the
+                # shadow back on; keep it off while the strip is out of sight.
+                mover.shadow(False)
             return
         inside = x - 8 <= mouse[0] <= x + w + 8 and y - 8 <= mouse[1] <= y + h + 8
         if inside:
