@@ -21,9 +21,11 @@ python belt.py --probe   # one sample of every metric, no UI
 
 Three levels of detail:
 
-- **Mini** — three lines: headline numbers with small graphs, network and
-  Claude status, then whatever needs attention. Used automatically when the
-  window is under 90 columns or 16 rows; `m` toggles it at any size.
+- **Mini** — the strip. When something is wrong it lists **findings** (below),
+  worst first; otherwise it is one quiet line: `● all clear`, then chats
+  waiting, VRAM, today's Claude spend, the fullest drive and the time. Used
+  automatically when the window is under 90 columns or 16 rows; `m` toggles it
+  at any size.
 - **Standard** — eight cards, each leading with one number and a 5-minute
   graph that fills the card's spare height. A top bar lists what needs
   attention (click it, or press `h`, for the health view). It is also the
@@ -31,7 +33,7 @@ Three levels of detail:
   Windows Terminal focus mode (`wt --focus`) usable. While the mouse is over
   it, three buttons appear at its right end: `▾` small mode, `–` minimize,
   `×` close. Small mode is the strip in a narrow always-on-top window at the
-  top centre of the screen that slides up out of sight (leaving a 4 px sliver)
+  top centre of the screen, as tall as its lines, that slides up out of sight (leaving a 4 px sliver)
   half a second after the mouse leaves it, and slides down when the mouse
   reaches the sliver, like Zoom's meeting controls. Drag the strip down to
   park it somewhere else (it then stays visible); drop it near the top edge to
@@ -75,6 +77,42 @@ available from Windows. On AMD cards `gpusensors.py` reads them from the driver'
 Slower facts come from a fourth thread: Ollama's `/api/ps` every 5 s, the
 event log every 5 minutes (about 0.3 s, no admin needed), and RAM, board, BIOS
 and driver details once at start.
+
+### Findings: what is wrong, why, and what to do
+
+Levels (`cpu 8%`) are nearly always normal, so nobody reads them. A **finding**
+is a diagnosis instead: a plain title, *why* (the facts that prove it, with
+numbers) and *what to do*, often with a button that does it. Rules in `rules/`
+work them out every slow pass (3 s; every 12 s while the strip is hidden, so a
+hidden strip still alerts). A finding disappears by itself once its cause is
+gone; nothing needs dismissing.
+
+| Group | On by default | Catches |
+| --- | --- | --- |
+| `agents` | yes | a chat probably waiting for your permission; an agent stuck on one step; chats finished and waiting on you a long time; Claude spend over your daily limit |
+| `hygiene` | yes | a drive under your floor, or filling fast enough to get there within the hour; a process that has pinned a core for hours (hidden by "6% of the CPU"); scripts left running after whatever started them closed; caches stranded on C: after their env var moved them |
+| `models` | no | Ollama: a model starving a game of VRAM, a model spilling into system RAM, two models that do not fit together, reload churn |
+| `remote` | no | Sunshine: a stream live right now (only its log knows; the stream is UDP), the screen left at the stream's resolution |
+
+- **On the strip:** each finding is two lines, its buttons at the right. A
+  button that ends a process or deletes something asks for a second click and
+  names exactly what it will touch. `mute` offers 1 hour, until restart, or
+  forever (critical findings: 1 hour at most); muted ones are counted on the
+  quiet line, click the count to see or unmute them. A **critical** finding
+  turns the strip red and plays `attention.wav` once, when it appears.
+- **Hidden strip:** with findings, one row stays showing: how many, chats
+  waiting, the time. Without, it is the usual 4 px sliver.
+- **`f`** opens Findings: each in full, then the ones that have cleared, with
+  how long they lasted (kept across restarts, in
+  `%APPDATA%\UtilityBelt\findings-history.jsonl`).
+- **Settings:** `%APPDATA%\UtilityBelt\config.toml`, made with comments on
+  first run: which groups run, thresholds, the quiet line's items, mutes.
+  Only its `[mutes]` table is ever rewritten. A broken file falls back to the
+  defaults and says so as a finding.
+- `python belt.py rules --list` shows every rule, whether it runs and whether
+  it is muted. `rules/README.md` explains how to write one (`rules/example.py`
+  is one to copy). Rules only read what the sampler already gathered; they
+  never touch the system themselves.
 
 ### `dash.py` — the same picture as one static frame
 

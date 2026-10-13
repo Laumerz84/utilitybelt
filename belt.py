@@ -68,6 +68,10 @@ from textual.screen import Screen
 from textual.widgets import Static
 
 import agentlog
+import beltconfig
+import findings
+import notify
+import signals
 import gpusensors
 import update_check
 
@@ -145,6 +149,10 @@ CLAUDE = HOME / ".claude"
 PROJECTS = CLAUDE / "projects"
 
 HIST = 300                      # samples kept per series (5 minutes at 1 Hz)
+HIDDEN_FAST_EVERY = 5.0         # seconds between cheap samples while the strip is
+                                # slid out of sight: coarse history, not a gap
+HIDDEN_SLOW_EVERY = 4           # ...and only every 4th process/disk walk (~12 s)
+STRANDED_EVERY = 6 * 3600       # how often to look for caches left behind on C:
 AGENT_LIVE_SECONDS = 90         # an agent transcript touched more recently than
                                 # this is treated as still working
 SESSION_RECENT_HOURS = 12       # chats older than this are not "waiting on you"
@@ -416,6 +424,11 @@ class Sampler:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.stop = threading.Event()
+        # Set while the strip is docked and slid out of sight. Nothing on screen can
+        # be read then, so the loops below back off: the expensive walks are skipped
+        # entirely and the cheap counters drop to a coarse interval, so the graphs
+        # still have (low-resolution) history when the strip slides back down.
+        self.hidden = threading.Event()
 
         self.cpu = Series()
         self.cpu_cores: list[Series] = []
@@ -452,7 +465,18 @@ class Sampler:
             "leftovers": [],
             "tailscale": None,          # None = not installed, else up/down
             "errors": [],
+            # For findings (findings.py, rules/): what is wrong and what to do.
+            "findings": [],             # the current set, worked out every slow pass
+            "disk_history": {},         # {device: ((t, free), ...)} for disk trends
+            "stranded": [],             # caches left on C: after their env var moved them
+            "ollama_loads": (),         # ((t, model), ...) each time a model was loaded
+            "sunshine": None,           # remote rules only: stream state from Sunshine's log
         }
+        self.engine = None              # a findings.Engine, set by main(); None = no findings
+        self._disk_hist: dict = defaultdict(lambda: deque(maxlen=400))
+        self._ollama_names: set = set()
+        self._ollama_loads: deque = deque(maxlen=50)
+        self._sun = {"pos": None, "live": False, "since": 0.0, "screen": "", "screen_before": ""}
 
         self._proc_cache: dict[int, psutil.Process] = {}
         self._cmd_cache: dict[tuple, str] = {}
@@ -466,6 +490,7 @@ class Sampler:
         threading.Thread(target=self._slow_loop, daemon=True).start()
         threading.Thread(target=self._gpu_loop, daemon=True).start()
         threading.Thread(target=self._info_loop, daemon=True).start()
+        threading.Thread(target=self._stranded_loop, daemon=True).start()
 
         # Live agent feed: an AgentLog per followed transcript, read incrementally.
         self._agent_logs: dict[Path, agentlog.AgentLog] = {}
@@ -478,7 +503,7 @@ class Sampler:
         psutil.cpu_percent(percpu=True)          # prime; first call is garbage
         adl = gpusensors.AdlReader()             # AMD temperature/fan/power; .ok False elsewhere
         tick = 0
-        while not self.stop.wait(1.0):
+        while not self.stop.wait(HIDDEN_FAST_EVERY if self.hidden.is_set() else 1.0):
             tick += 1
             if adl.ok and tick % 2 == 0:         # every 2 s; a read takes ~0.3 ms
                 reading = adl.read()
@@ -520,20 +545,41 @@ class Sampler:
 
     # -- slow: every few seconds, the expensive walks
     def _slow_loop(self) -> None:
-        tick = 0
+        tick, last_claude = 0, 0.0
         while not self.stop.wait(3.0):
             tick += 1
+            # Out of sight: walk every 4th tick (~12 s) instead of every one. Not
+            # never: the findings are worked out here, and the hidden strip's sliver
+            # still has to raise them.
+            if self.hidden.is_set() and tick % HIDDEN_SLOW_EVERY:
+                continue
             try:
                 self._sample_processes()
                 self._sample_disks()
                 self._sample_nets()
             except Exception as exc:
                 self._note(f"slow: {exc}")
-            if tick % 7 == 1:                              # ~every 21s
+            if time.time() - last_claude >= 21:            # ~every 21 s
+                last_claude = time.time()
                 try:
                     self._sample_claude()
                 except Exception as exc:
                     self._note(f"claude: {exc}")
+            self._evaluate()
+
+    def _evaluate(self) -> None:
+        """Work out the findings (findings.py) from this pass's readings."""
+        if self.engine is None:
+            return
+        snap = self.read()
+        snap["now"] = time.time()
+        try:
+            found = self.engine.evaluate(snap)
+        except Exception as exc:                           # the engine itself: never fatal
+            self._note(f"findings: {type(exc).__name__}: {exc}")
+            return
+        with self.lock:
+            self.snap["findings"] = found
 
     def _cmdline(self, pid: int, created: float) -> str:
         key = (pid, created)                               # pid alone gets reused
@@ -548,7 +594,7 @@ class Sampler:
         rows = []
         alive = set()
         for proc in psutil.process_iter(["pid", "name", "memory_info", "num_threads",
-                                         "ppid", "create_time"]):
+                                         "ppid", "create_time", "cpu_times"]):
             try:
                 pid = proc.info["pid"]
                 if pid == 0:                               # System Idle Process: idle time, not a program
@@ -563,15 +609,22 @@ class Sampler:
                 else:
                     cpu = cached.cpu_percent(None)
                 mem = proc.info["memory_info"]
-                rows.append({
+                times = proc.info.get("cpu_times")
+                row = {
                     "pid": pid,
                     "name": proc.info["name"] or "?",
                     "cpu": cpu / max(1, psutil.cpu_count(logical=True)),
+                    # seconds of CPU since it started: an instantaneous % of the
+                    # whole CPU hides a process that has pinned one core for a day
+                    "cpu_time": (times.user + times.system) if times else 0.0,
                     "rss": getattr(mem, "rss", 0) or 0,
                     "threads": proc.info.get("num_threads") or 0,
                     "ppid": proc.info.get("ppid") or 0,
                     "created": proc.info.get("create_time") or 0,
-                })
+                }
+                if row["name"].lower() in LEFTOVER_NAMES:     # which script, not just "python.exe"
+                    row["what"] = describe_cmd(self._cmdline(pid, row["created"])) or row["name"]
+                rows.append(row)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
         for pid in list(self._proc_cache):
@@ -659,8 +712,12 @@ class Sampler:
                 "free": usage.free, "percent": usage.percent,
             })
         out.sort(key=lambda d: d["device"])
+        now = time.time()
+        for d in out:
+            self._disk_hist[d["device"]].append((now, d["free"]))
         with self.lock:
             self.snap["disks"] = out
+            self.snap["disk_history"] = {k: tuple(v) for k, v in self._disk_hist.items()}
             self.snap["per_disk"] = {
                 k: {"read": v.read_bytes, "write": v.write_bytes,
                     "rcount": v.read_count, "wcount": v.write_count}
@@ -749,15 +806,69 @@ class Sampler:
                         self.snap["sysinfo"] = info or {}
                 if tick % 60 == 0:
                     self._sample_events()
+            engine = self.engine
+            if engine is not None and engine.cfg.rules.get("remote"):
+                try:
+                    self._sample_sunshine(engine.cfg.remote.get("sunshine_log") or "")
+                except Exception as exc:
+                    self._note(f"sunshine: {exc}")
             tick += 1
             if self.stop.wait(5.0):
                 break
+
+    # -- caches left behind on C: when an env var moved them (once, then every 6 h)
+    def _stranded_loop(self) -> None:
+        if sys.platform != "win32":
+            return
+        wait = 20.0                                         # let the first passes settle first
+        while not self.stop.wait(wait):
+            wait = STRANDED_EVERY
+            try:
+                found = signals.stranded_caches()
+            except Exception as exc:
+                self._note(f"stranded: {exc}")
+                continue
+            with self.lock:
+                self.snap["stranded"] = found
+
+    # -- Sunshine: is anyone streaming this PC? Only its log knows (the stream is
+    # UDP, so netstat shows nothing but the listener).
+    def _sample_sunshine(self, log: str) -> None:
+        sun = self._sun
+        screen = signals.screen_size()
+        path = Path(log)
+        if not log or not path.is_file():
+            with self.lock:
+                self.snap["sunshine"] = None
+            return
+        size = path.stat().st_size
+        if sun["pos"] is None or size < sun["pos"]:          # first look, or the log was rotated
+            sun["pos"] = max(0, size - 256 * 1024)
+        if size > sun["pos"]:
+            with path.open("rb") as fh:
+                fh.seek(sun["pos"])
+                chunk = fh.read(size - sun["pos"]).decode("utf-8", "replace")
+            sun["pos"] = size
+            for line in chunk.splitlines():
+                if "CLIENT CONNECTED" in line:
+                    sun.update(live=True, since=signals.log_time(line) or time.time(),
+                               screen_before=sun["screen"] or screen)
+                elif "CLIENT DISCONNECTED" in line:
+                    sun["live"] = False
+        if not sun["live"]:
+            sun["screen"] = screen                          # what it is outside a stream
+            if screen == sun["screen_before"]:
+                sun["screen_before"] = ""                   # put back: nothing to report
+        with self.lock:
+            self.snap["sunshine"] = {"live": sun["live"], "since": sun["since"],
+                                     "screen": screen, "screen_before": sun["screen_before"]}
 
     def _sample_ollama(self) -> None:
         try:
             with urllib.request.urlopen(OLLAMA_PS, timeout=1.0) as resp:
                 data = json.load(resp)
         except Exception:
+            self._ollama_names = set()
             with self.lock:
                 self.snap["ollama"] = {"up": False, "models": []}
             return
@@ -772,8 +883,13 @@ class Sampler:
                            "vram": m.get("size_vram") or 0, "size": m.get("size") or 0,
                            "params": (m.get("details") or {}).get("parameter_size") or "",
                            "context": m.get("context_length") or 0, "until": until})
+        names = {m["name"] for m in models}
+        for name in names - self._ollama_names:            # newly loaded since the last poll
+            self._ollama_loads.append((time.time(), name))
+        self._ollama_names = names
         with self.lock:
             self.snap["ollama"] = {"up": True, "models": models}
+            self.snap["ollama_loads"] = tuple(self._ollama_loads)
 
     def _sample_events(self) -> None:
         raw = ps_json(EVENTS_PS.replace("__DAYS__", str(EVENT_DAYS)))
@@ -1199,9 +1315,20 @@ def is_click(press: tuple, release: tuple, slop: int = 4) -> bool:
 
 BAR_BUTTONS_FULL = (("▾", "small"), ("–", "minimize"), ("×", "close"))
 BAR_BUTTONS_SMALL = (("▴", "full"), ("–", "minimize"), ("×", "close"))
-SMALL_COLS, SMALL_ROWS = 88, 4          # the small strip's window, in terminal cells
+SMALL_COLS, SMALL_ROWS = 88, 4          # the small strip's window, in terminal cells (4 rows:
+                                        # about the shortest Windows Terminal will make one)
 PEEK = 4                                # px of a hidden strip left showing at the top edge
 HIDE_AFTER = 0.5                        # s the mouse must be away before it slides up
+STRIP_MAX_FINDINGS = 3                  # findings shown on the strip; the rest under f
+CONFIRM_SECONDS = 6                     # how long a "click again" button waits
+SEV_MARK = {"critical": "■", "warn": "▲", "info": "●"}   # shape as well as colour
+SEV_STYLE = {
+    "critical": {"mark": "bold red", "title": "bold #f3c6bf", "why": "#b09a96",
+                 "button": "bold black on #e0705f"},
+    "warn": {"mark": "bold #e8a33d", "title": "bold #f0d9a8", "why": "grey62",
+             "button": "bold black on #e8a33d"},
+    "info": {"mark": "#6fa8dc", "title": "#c7ced8", "why": "grey50", "button": "grey85 on grey23"},
+}
 
 
 def button_strip(buttons) -> str:
@@ -1460,10 +1587,33 @@ class TopBar(DragBar):
 
 
 class MiniStrip(DragBar):
-    """The small strip: drag anywhere to move; buttons on its last line."""
+    """The small strip: drag anywhere to move; window buttons on its last line,
+    each finding's own buttons (act, mute) at the end of its title line."""
 
     BUTTONS = BAR_BUTTONS_SMALL
-    BUTTON_ROW = 2                                         # third line, after the clock
+    BUTTON_ROW = 0                                         # set on each draw: the quiet row
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.hits: dict = {}                               # row -> [(x0, x1, hit)], from render_mini
+
+    def _hit(self, event):
+        off = event.get_content_offset(self)
+        if off is None:
+            return None
+        return next((hit for x0, x1, hit in self.hits.get(off.y, ()) if x0 <= off.x < x1), None)
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        if event.button == 1 and self._hit(event):
+            return                                          # a finding button: acts on the click
+        super().on_mouse_down(event)
+
+    def on_click(self, event: events.Click) -> None:
+        hit = self._hit(event)
+        if hit:
+            self.app.strip_hit(hit)
+        else:
+            super().on_click(event)
 
     def on_drag_end(self) -> None:
         self.app.strip_dropped()
@@ -1485,9 +1635,20 @@ class Overview(Screen):
         yield MiniStrip(id="mini")
 
     def on_mount(self) -> None:
-        self.set_interval(1.0, self.redraw)
+        self.set_interval(1.0, self._tick)
         self.apply_mode()
         self.redraw()
+
+    def _tick(self) -> None:
+        app = self.app
+        if not app.ui_hidden():
+            self.redraw()
+            return
+        # Out of sight: repaint only when the sliver's one line would change
+        sig = app.sliver_signature(app.sampler.read())
+        if sig != getattr(self, "_sliver_sig", None):
+            self._sliver_sig = sig
+            self.redraw()
 
     def on_resize(self, event: events.Resize) -> None:
         self.apply_mode()
@@ -1513,9 +1674,11 @@ class Overview(Screen):
         if self.is_mini():
             strip = self.query_one("#mini", MiniStrip)
             strip.update(app.render_mini(snap, alerts, self.size.width - 2, bar=strip))
+            strip.set_class(app._strip_crit, "-crit")
+            app.fit_strip()
             return
         bar = self.query_one("#topbar", TopBar)
-        bar.update(app.render_topbar(alerts, self.size.width - 4, bar=bar))
+        bar.update(app.render_topbar(alerts, self.size.width - 4, bar=bar, found=snap.get("findings")))
         for key, _ in self.CARDS:
             try:
                 card = self.query_one(f"#card-{key}", Card)
@@ -1537,7 +1700,7 @@ class Overview(Screen):
             n = info.behind
             note = f"   [bold yellow]⬆ Update available ({n} new change{'s' if n != 1 else ''}) · u to update[/]" + note
         self.query_one("#hint", Static).update(
-            "[dim]1-8 open a panel · h health · m mini view · q quit[/]" + note)
+            "[dim]1-8 open a panel · f findings · h health · m mini view · q quit[/]" + note)
 
 
 class Detail(Screen):
@@ -1545,7 +1708,8 @@ class Detail(Screen):
 
     TITLES = {"cpu": "CPU", "memory": "Memory", "gpu": "GPU", "storage": "Storage",
               "network": "Network", "claude": "Claude", "agents": "Agents",
-              "processes": "Processes", "health": "Health", "update": "Update"}
+              "processes": "Processes", "health": "Health", "update": "Update",
+              "findings": "Findings"}
 
     def __init__(self, key: str) -> None:
         super().__init__()
@@ -1558,8 +1722,12 @@ class Detail(Screen):
         yield Static(id="dhint")
 
     def on_mount(self) -> None:
-        self.set_interval(1.0, self.redraw)
+        self.set_interval(1.0, self._tick)
         self.redraw()
+
+    def _tick(self) -> None:
+        if not self.app.ui_hidden():        # out of sight: nothing to repaint
+            self.redraw()
 
     def redraw(self) -> None:
         snap = self.app.sampler.read()
@@ -1569,7 +1737,7 @@ class Detail(Screen):
         self.query_one("#detail-content", Static).update(
             self.app.render_detail(self.key, snap, max(40, self.size.width - 8)))
         self.query_one("#dhint", Static).update(
-            "[dim]esc back · 1-8 other panels · h health · u update · q back[/]")
+            "[dim]esc back · 1-8 other panels · f findings · h health · u update · q back[/]")
 
 
 class AgentBlock(Static):
@@ -1733,6 +1901,7 @@ class Belt(App):
     #mini { display: none; padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
     Overview.-mini #topbar, Overview.-mini #grid, Overview.-mini #hint { display: none; }
     Overview.-mini #mini { display: block; height: 100%; }
+    #mini.-crit { background: #2a1416; }
     #dtitle { height: 1; padding: 0 2; background: $panel; }
     #detail-body { padding: 1 3; }
     #dhint { height: 1; padding: 0 2; }
@@ -1755,6 +1924,7 @@ class Belt(App):
         ("7", "detail('agents')", "Agents"),
         ("8", "detail('processes')", "Processes"),
         ("h", "detail('health')", "Health"),
+        ("f", "detail('findings')", "Findings"),
         ("m", "toggle_mini", "Mini"),
         ("u", "detail('update')", "Update"),
         ("c", "copy_update", "Copy update command"),
@@ -1770,6 +1940,28 @@ class Belt(App):
         self.update_info: update_check.UpdateInfo | None = None
         self.update_checked_at: datetime | None = None
         self._update_thread: threading.Thread | None = None
+        self._docked = False                # docked at the top edge in slide-away mode
+        self._shown = True                  # ...and currently in view
+        # findings on the strip
+        self._strip_rows = 1                # lines the strip drew last time
+        self._strip_crit = False            # ...and whether one was critical
+        self._confirm = None                # (finding key, deadline): waiting for the second click
+        self._acting: dict = {}            # finding key -> until when its button says "working"
+        self._mute_menu = None              # finding key whose mute choices are open
+        self._show_muted = False
+
+    def ui_hidden(self) -> bool:
+        """Docked and slid up out of sight: nothing on screen can be read."""
+        return self._docked and not self._shown
+
+    def _sync_sampler(self) -> None:
+        """Keep the sampler's back-off flag in step with what is actually on screen.
+        Called from every place that changes _docked or _shown: undocking the strip
+        while it is hidden must put the sampler back to full rate, not strand it."""
+        if self.ui_hidden():
+            self.sampler.hidden.set()
+        else:
+            self.sampler.hidden.clear()
 
     def on_mount(self) -> None:
         self.push_screen(Overview())
@@ -1823,12 +2015,18 @@ class Belt(App):
             cell = (cw / max(1, self.size.width), ch / max(1, self.size.height))
             if small:
                 self._full_rect = (x, y, w, h)
+                self._cell, self._edges = cell, (w - cw, h - ch)   # for fitting it to its lines
                 area = mover.work_area()
-                mover.set_rect(*small_rect(cell, (w - cw, h - ch), area))
+                mover.set_rect(*small_rect(cell, self._edges, area, rows=max(SMALL_ROWS, self._strip_rows)))
                 mover.topmost(True)
                 self._start_autohide(area[1])
             else:
                 self._stop_autohide()
+                # Leaving slide-away mode: the window is about to be fully visible
+                # again, so drop the docked/hidden state with it or the repaint timer
+                # and the sampler would stay backed off on a window in plain view.
+                self._docked, self._shown = False, True
+                self._sync_sampler()
                 mover.topmost(False)
                 mover.shadow(True)
                 if getattr(self, "_full_rect", None):
@@ -1846,6 +2044,7 @@ class Belt(App):
     def _start_autohide(self, top: int) -> None:
         self._dock_top, self._docked, self._shown = top, True, True
         self._away_since, self._sliding = None, False
+        self._sync_sampler()
         self._stop_autohide()
         self._autohide_timer = self.set_interval(0.05, self._autohide)
 
@@ -1862,8 +2061,12 @@ class Belt(App):
         x, y, w, h = mover.rect()
         mouse = mover.mouse()
         if not self._shown:
-            if wants_open(mouse, x, w, self._dock_top):
-                self._slide(self._dock_top, shown=True)
+            peek = self.strip_peek()
+            if wants_open(mouse, x, w, self._dock_top, peek=peek):
+                self._slide(self.shown_y(), shown=True)
+            elif y != hidden_y(self._dock_top, h, peek):
+                # something to report appeared (or went) while hidden: show one row of it, or not
+                self.mover.move_to(x, hidden_y(self._dock_top, h, peek))
             elif mover.shadow_is_on():
                 # Windows Terminal redraws its frame after a move and turns the
                 # shadow back on; keep it off while the strip is out of sight.
@@ -1875,12 +2078,16 @@ class Belt(App):
         elif self._away_since is None:
             self._away_since = time.time()
         elif time.time() - self._away_since >= HIDE_AFTER:
-            self._slide(hidden_y(self._dock_top, h), shown=False)
+            self._mute_menu = self._confirm = None          # half-done clicks do not survive hiding
+            self._slide(hidden_y(self._dock_top, h, self.strip_peek()), shown=False)
 
     def _slide(self, target_y: int, shown: bool) -> None:
         x, y, _, _ = self.mover.rect()
         steps = slide_steps(y, target_y)
         self._sliding, self._shown, self._away_since = True, shown, None
+        self._sync_sampler()
+        if isinstance(self.screen, Overview):
+            self.screen.redraw()                            # the full strip, or the sliver's line
         if shown:
             self.mover.shadow(True)                         # back before it comes into view
 
@@ -1903,8 +2110,9 @@ class Belt(App):
         self._docked = docks(y, self._dock_top)
         self.mover.shadow(True)
         if self._docked:
-            self.mover.move_to(x, self._dock_top)
+            self.mover.move_to(x, self.shown_y())
             self._shown, self._away_since = True, None
+        self._sync_sampler()
 
     def bar_action(self, action: str) -> None:
         if action in ("small", "full"):
@@ -2075,46 +2283,289 @@ class Belt(App):
         marks = [f"[bold]{m}[/]" if a == bar.hot else f"[dim]{m}[/]" for m, a in bar.BUTTONS]
         return "   " + "  ".join(marks)
 
-    def render_topbar(self, alerts: list[dict], width: int, bar=None) -> Text:
-        return self._line(f"[bold]UtilityBelt[/]   {self._alert_text(alerts)}",
+    def render_topbar(self, alerts: list[dict], width: int, bar=None, found=None) -> Text:
+        live = [f for f in found or [] if not f.muted]
+        lead = ""
+        if live:
+            sev = SEV_STYLE[live[0].severity]
+            lead = (f"[{sev['mark']}]{SEV_MARK[live[0].severity]} {len(live)} "
+                    f"finding{'s' if len(live) > 1 else ''}[/] [dim](f)[/]   ")
+        return self._line(f"[bold]UtilityBelt[/]   {lead}{self._alert_text(alerts)}",
                           f"[dim]{datetime.now():%H:%M:%S}[/]{self._buttons(bar)}", width)
 
+    # ---- the strip: findings when something is wrong, one quiet line when not
+
     def render_mini(self, snap: dict, alerts: list[dict], width: int, bar=None) -> Text:
-        s = self.sampler
-        vtotal = snap.get("vram_total") or 0
-        vpct = (snap.get("vram_used") or 0) / vtotal * 100 if vtotal else 0
-        vm = snap.get("mem")
-        cpu_l = level(s.cpu.recent(10), 85, 95)
-        v_l = level(vpct, 90, 97)
-        m_l = level(vm.percent if vm else 0, 85, 93)
-        spark_w = 8 if width >= 100 else 5
+        """Findings on top (worst first), each a title line with its buttons and a
+        line of why and what to do; the quiet row below. Nothing wrong: only the
+        quiet row. Slid out of sight: one centred line for the sliver.
+        Records where each button is (bar.hits) for MiniStrip's clicks."""
+        found = snap.get("findings") or []
+        live = [f for f in found if not f.muted]
+        muted = [f for f in found if f.muted]
+        hits: dict = {}
+        lines: list[Text] = []
 
-        parts = [
-            f"CPU [{NUM[cpu_l]}]{s.cpu.now:3.0f}%[/] {chart(s.cpu.points, spark_w, lvl=cpu_l)[0]}",
-            f"GPU [bold]{s.gpu.now:3.0f}%[/]{self._gpu_temp(snap)} {chart(s.gpu.points, spark_w)[0]}",
-            f"VRAM [{NUM[v_l]}]{vpct:.0f}%[/]",
-            f"MEM [{NUM[m_l]}]{vm.percent if vm else 0:.0f}%[/]",
-        ]
-        tight = sorted(snap.get("disks") or [], key=lambda d: d["free"])
-        if tight:
-            d = tight[0]
-            parts.append(f"{d['device']} [{NUM[disk_level(d)]}]{human_bytes(d['free'])}[/] free")
-        line1 = "   ".join(parts)
+        if self.ui_hidden() and live:                      # only the bottom row shows
+            rows = max(1, self.screen.size.height if self.screen else 1)
+            lines = [Text("")] * (rows - 1) + [self._sliver_line(snap, live, muted, width)]
+            if bar is not None:
+                bar.hits, bar.BUTTON_ROW = {}, -1
+            return Text("\n").join(lines)
 
-        net = f"↓ {rate(s.net_down.now)}  ↑ {rate(s.net_up.now)}"
-        ts = snap.get("tailscale")
-        if ts is not None:
-            net += "   Tailscale " + ("[green]✓[/]" if ts else "[yellow]off[/]")
-        line2 = f"{net}   {self._claude_summary(snap)}"
+        for f in live[:STRIP_MAX_FINDINGS]:
+            sev = SEV_STYLE[f.severity]
+            head = f"[{sev['mark']}]{SEV_MARK[f.severity]}[/] "
+            if f.severity == "critical":
+                head += f"[{sev['mark']}]ACT NOW[/]  "
+            head += f"[{sev['title']}]{escape(f.title)}[/]"
+            pieces = []
+            if f.action is not None:
+                if f.key in self._acting and time.time() < self._acting[f.key]:
+                    pieces.append(("[dim] working… [/]", 10, None))
+                elif self._confirm and self._confirm[0] == f.key and time.time() < self._confirm[1]:
+                    text = f.action.confirm_label or f"{f.action.label}? click again"
+                    pieces.append((f"[bold reverse red] {escape(text)} [/]", len(text) + 2, ("act", f.key)))
+                else:
+                    pieces.append((f"[{sev['button']}] {escape(f.action.label)} [/]",
+                                   len(f.action.label) + 2, ("act", f.key)))
+            pieces.append(("[on grey23] mute [/]", 6, ("mute", f.key)))
+            row = len(lines)
+            lines.append(self._line_with_buttons(head, pieces, width, row, hits))
+            if self._mute_menu == f.key:
+                opts = [("1 hour", "1h")] + ([] if f.severity == "critical" else
+                                             [("until restart", "reboot"), ("forever", "forever")])
+                opts.append(("cancel", "cancel"))
+                lines.append(self._left_buttons("   [dim]mute for:[/] ", 13,
+                                                [(f" {t} ", ("mute_for", f.key, how)) for t, how in opts],
+                                                width, row + 1, hits))
+            else:
+                lines.append(self._line(f"   [{sev['why']}]{escape(f.because)}[/] [dim]→ {escape(f.fix)}[/]",
+                                        "", width))
+        if self._show_muted:
+            for f in muted:
+                row = len(lines)
+                lines.append(self._line_with_buttons(
+                    f"[dim]○ {escape(f.title)} · muted[/]", [("[on grey23] unmute [/]", 8, ("unmute", f.key))],
+                    width, row, hits))
 
+        # the quiet row: demoted below the findings, the whole strip when there are none
+        cited = {c for f in live for c in f.cites}
+        crit = any(f.severity == "critical" for f in live)
+        left = "[green]●[/] [dim]all clear[/]" if not live else ""
+        more = len(live) - STRIP_MAX_FINDINGS
+        extra = [f"[bold]+{more} more[/] [dim](f)[/]"] if more > 0 else []
+        left = "   ".join(x for x in [left, *extra, self._quiet_items(snap, cited, crit)] if x)
+        right = []
+        if muted:
+            label = f"{len(muted)} muted"
+            right.append((f"[dim underline]{label}[/]", len(label), ("muted", "")))
         info = self.update_info
-        update = "[yellow]⬆ update (u)[/]  " if info is not None and info.available else ""
-        return Text("\n").join([
-            self._line(line1, "", width),
-            self._line(line2, "", width),
-            self._line(self._alert_text(alerts, limit=3),
-                       f"{update}[dim]{datetime.now():%H:%M}[/]{self._buttons(bar)}", width),
-        ])
+        if info is not None and info.available:
+            right.append(("[yellow]⬆ update (u)[/]", 12, None))
+        if "clock" in self._quiet_row():
+            right.append((f"[dim]{datetime.now():%H:%M}[/]", 5, None))
+        row = len(lines)
+        btns = self._buttons(bar)
+        lines.append(self._line_with_buttons(left, right, width - Text.from_markup(btns).cell_len,
+                                             row, hits, tail=btns))
+        self._strip_rows = len(lines)
+        pad = (self.screen.size.height if self.screen else 0) - len(lines)
+        if self._docked and pad > 0:                       # docked: lines sit at the bottom (see shown_y)
+            lines = [Text("")] * pad + lines
+            hits = {r + pad: v for r, v in hits.items()}
+            row += pad
+        if bar is not None:
+            bar.hits, bar.BUTTON_ROW = hits, row
+        self._strip_crit = crit
+        return Text("\n").join(lines)
+
+    def _quiet_row(self) -> list:
+        engine = self.sampler.engine
+        return engine.cfg.quiet_row if engine else ["agents", "vram", "spend", "disk", "clock"]
+
+    def _quiet_items(self, snap: dict, cited: set, crit: bool) -> str:
+        """The quiet row's values: low contrast, except one a finding is about."""
+        s = self.sampler
+        hot = "bold red" if crit else "bold yellow"
+        out = []
+        for item in self._quiet_row():
+            label, value = item, None
+            if item == "agents":
+                if not snap.get("claude_ready"):
+                    value = "scanning…"
+                else:
+                    states = Counter(x["state"] for x in snap["claude"]["sessions"])
+                    working = states["working"] + sum(1 for a in snap.get("agents") or [] if a["live"])
+                    bits = [f"{states['waiting']} waiting" if states["waiting"] else "",
+                            f"{states['approval']} need ok" if states["approval"] else "",
+                            f"{working} working" if working else ""]
+                    value = " ".join(b for b in bits if b) or "idle"
+            elif item == "vram":
+                total = snap.get("vram_total") or 0
+                if total:
+                    value = f"{(snap.get('vram_used') or 0) / 1024 ** 3:.1f}/{total / 1024 ** 3:.1f}"
+            elif item == "spend":
+                if snap.get("claude_ready"):
+                    value = f"${snap['claude']['today_cost']:,.0f}"
+            elif item == "disk":
+                tight = sorted(snap.get("disks") or [], key=lambda d: d["free"])
+                if tight:
+                    label, value = tight[0]["device"], human_bytes(tight[0]["free"])
+            elif item == "cpu":
+                value = f"{s.cpu.now:.0f}%"
+            elif item == "gpu":
+                value = f"{s.gpu.now:.0f}%"
+            elif item == "mem":
+                vm = snap.get("mem")
+                value = f"{vm.percent:.0f}%" if vm else None
+            elif item == "net":
+                value = f"↓{rate(s.net_down.now)} ↑{rate(s.net_up.now)}"
+            elif item == "gputemp":
+                t = (snap.get("gpu_sensors") or {}).get("edge")
+                value = f"{t}°C" if t is not None else None
+            if value is None:
+                continue
+            style = hot if item in cited else "grey70"
+            out.append(f"[grey50]{escape(label)}[/] [{style}]{escape(value)}[/]")
+        return "  ".join(out)
+
+    def _sliver_line(self, snap: dict, live: list, muted: list, width: int) -> Text:
+        """What the slid-away strip still shows: how many findings, chats
+        waiting, the time. Centred, like a tab hanging from the top edge."""
+        worst = live[0].severity
+        sev = SEV_STYLE[worst]
+        bits = [f"[{sev['mark']}]{SEV_MARK[worst]} {len(live) + len(muted)}[/]"]
+        if snap.get("claude_ready"):
+            waiting = sum(1 for x in snap["claude"]["sessions"] if x["state"] == "waiting")
+            if waiting:
+                bits.append(f"[grey70]{waiting} waiting[/]")
+        bits.append(f"[dim]{datetime.now():%H:%M}[/]")
+        t = Text.from_markup("  [grey30]│[/]  ".join(bits))
+        t.pad_left(max(0, (width - t.cell_len) // 2))
+        return t
+
+    def sliver_signature(self, snap: dict) -> tuple:
+        """Changes exactly when the hidden strip's one line would."""
+        found = snap.get("findings") or []
+        live = [f for f in found if not f.muted]
+        waiting = (sum(1 for x in snap["claude"]["sessions"] if x["state"] == "waiting")
+                   if snap.get("claude_ready") else 0)
+        return (len(found), live[0].severity if live else "", waiting, datetime.now().strftime("%H:%M"))
+
+    def _line_with_buttons(self, left: str, pieces: list, width: int, row: int, hits: dict,
+                           tail: str = "") -> Text:
+        """`left` cut to fit, then right-aligned buttons; each button's columns go in hits."""
+        right = "  ".join(m for m, _, _ in pieces)
+        rlen = sum(n for _, n, _ in pieces) + 2 * max(0, len(pieces) - 1)
+        x = width - rlen
+        for _, n, hit in pieces:
+            if hit is not None:
+                hits.setdefault(row, []).append((x, x + n, hit))
+            x += n + 2
+        return self._line(left, right + tail, width + Text.from_markup(tail).cell_len)
+
+    @staticmethod
+    def _left_buttons(prefix: str, prefix_len: int, pieces: list, width: int, row: int, hits: dict) -> Text:
+        """A row of buttons from the left, after a label."""
+        x, parts = prefix_len, []
+        for text, hit in pieces:
+            parts.append(f"[on grey23]{escape(text)}[/]")
+            hits.setdefault(row, []).append((x, x + len(text), hit))
+            x += len(text) + 2
+        t = Text.from_markup(prefix + "  ".join(parts))
+        t.truncate(width, overflow="ellipsis")
+        return t
+
+    def strip_hit(self, hit: tuple) -> None:
+        """A click on one of the strip's finding buttons."""
+        engine, kind, key = self.sampler.engine, hit[0], hit[1]
+        if engine is None:
+            return
+        f = {x.key: x for x in self.sampler.read().get("findings") or []}.get(key)
+        if kind == "act" and f is not None and f.action is not None:
+            pending = self._confirm and self._confirm[0] == key and time.time() < self._confirm[1]
+            if f.action.confirm and not pending:
+                self._confirm = (key, time.time() + CONFIRM_SECONDS)
+            else:
+                self._confirm = None
+                self._acting[key] = time.time() + 10
+                engine.run_action(f, done=self._reevaluate)
+        elif kind == "mute":
+            self._mute_menu = None if self._mute_menu == key else key
+        elif kind == "mute_for":
+            self._mute_menu = None
+            if hit[2] != "cancel" and f is not None:
+                engine.mute(key, hit[2], f.severity)
+                self._reevaluate()
+        elif kind == "muted":
+            self._show_muted = not self._show_muted
+        elif kind == "unmute":
+            engine.unmute(key)
+            self._reevaluate()
+        if isinstance(self.screen, Overview):
+            self.screen.redraw()
+
+    def _reevaluate(self) -> None:
+        """Work the findings out again now (off the UI thread), not at the next pass."""
+        threading.Thread(target=self.sampler._evaluate, daemon=True).start()
+
+    def _visible(self, rows: int) -> int:
+        """Pixels from the window's bottom edge up to the top of its last `rows`
+        text rows: how much of a docked strip must be on screen to show them."""
+        c = self._cell[1]
+        _, ch = self.mover.client_size()
+        slack = max(0.0, ch - max(1, self.size.height) * c)   # the terminal's padding, top + bottom
+        return round(rows * c + slack / 2 + self._edges[1] / 2 + 4)
+
+    def strip_peek(self) -> int:
+        """How much of the hidden strip stays on screen: a sliver, or its whole
+        last row (count, waiting, time) while there is something to report."""
+        found = self.sampler.read().get("findings") or []
+        if not any(not f.muted for f in found) or not getattr(self, "_cell", None):
+            return PEEK
+        return self._visible(1)
+
+    def shown_y(self) -> int:
+        """Where a docked, slid-down strip sits. Its lines are drawn at the bottom
+        of the window; a window taller than its lines (Windows Terminal will not go
+        below about 4 rows) is pushed up past the screen edge by the difference,
+        so 'all clear' is one line on screen, not a line and three empty rows."""
+        _, _, _, h = self.mover.rect()
+        rows = max(1, self._strip_rows or 1)
+        if not getattr(self, "_cell", None) or rows >= self.size.height:
+            return self._dock_top
+        return self._dock_top - max(0, h - self._visible(rows))
+
+    def fit_strip(self) -> None:
+        """Small mode: make the window as tall as the strip's lines (but not under
+        the terminal's minimum), and keep a docked strip showing just its lines.
+        Pixels per row are only roughly known, as the terminal pads its text area:
+        resize, see how many rows that gave, and correct by whole rows."""
+        mover = self.mover
+        if (mover.hwnd is None or getattr(self, "_autohide_timer", None) is None
+                or not getattr(self, "_cell", None) or getattr(self, "_sliding", False)):
+            return
+        rows = max(SMALL_ROWS, getattr(self, "_min_rows", 0), self._strip_rows or 1)
+        x, y, w, h = mover.rect()
+        pending = getattr(self, "_fit_pending", None)
+        if rows != self.size.height:
+            if pending and pending[0] == h and pending[1] == self.size.height:
+                if time.time() - pending[2] < 1.5:
+                    return                                     # asked already; the resize is on its way
+                if rows < self.size.height:                    # asked to shrink and nothing happened:
+                    self._min_rows = self.size.height          # the terminal's own minimum
+                    return
+            want = max(self._edges[1] + 4, round(h + (rows - self.size.height) * self._cell[1]))
+            self._fit_pending = (want, self.size.height, time.time())
+            if self._docked:
+                y = hidden_y(self._dock_top, want, self.strip_peek()) if not self._shown else y
+            mover.set_rect(x, y, w, want)
+            return
+        if self._docked:                                       # right size: right place?
+            target = self.shown_y() if self._shown else hidden_y(self._dock_top, h, self.strip_peek())
+            if y != target:
+                mover.move_to(x, target)
 
     @staticmethod
     def _claude_summary(snap: dict) -> str:
@@ -2284,6 +2735,37 @@ class Belt(App):
             return getattr(self, f"_detail_{key}")(snap, self.sampler, width)
         except Exception as exc:
             return f"[red]{escape(type(exc).__name__)}: {escape(str(exc))}[/]"
+
+    def _detail_findings(self, snap, s, width) -> str:
+        engine = s.engine
+        if engine is None:
+            return "[dim]Findings are off in this window.[/]"
+        found = sorted(snap.get("findings") or [], key=lambda f: f.muted)   # muted last
+        out = []
+        if not any(not f.muted for f in found):
+            out.append("[green]●[/] All clear: nothing needs you right now.\n")
+        for f in found:
+            sev = SEV_STYLE[f.severity]
+            muted = "  [dim](muted)[/]" if f.muted else ""
+            out += [f"[{sev['mark']}]{SEV_MARK[f.severity]} {f.severity.upper()}[/]  "
+                    f"[{sev['title']}]{escape(f.title)}[/]{muted}  [dim]since {datetime.fromtimestamp(f.since):%H:%M}[/]",
+                    f"   [dim]why[/]  {escape(f.because)}",
+                    f"   [dim]fix[/]  {escape(f.fix)}"]
+            if f.action is not None:
+                out.append(f"   [dim]button on the strip:[/] {escape(f.action.label)}")
+            out.append("")
+        out += ["", "[bold]Cleared recently[/]  [dim](newest first; kept across restarts)[/]"]
+        if not engine.history:
+            out.append("  [dim]Nothing has come and gone yet.[/]")
+        for e in reversed(engine.history):
+            sev = SEV_STYLE.get(e["severity"], SEV_STYLE["info"])
+            start, end = e.get("since") or 0, e.get("cleared_at") or 0
+            out.append(f"  [dim]{datetime.fromtimestamp(end):%a %H:%M}[/]  [{sev['mark']}]{SEV_MARK.get(e['severity'], '●')}[/] "
+                       f"{escape(e['title'])}  [dim]for {duration(end - start)}"
+                       f"{' · muted' if e.get('muted') else ''}[/]")
+        out += ["", f"[dim]Settings, thresholds and mutes: {escape(str(engine.cfg.path))}"
+                    " · every rule: python belt.py rules --list[/]"]
+        return "\n".join(out)
 
     def _detail_update(self, snap, s, width) -> str:
         info, at = self.update_info, self.update_checked_at
@@ -2661,6 +3143,7 @@ class Belt(App):
 def probe() -> int:
     """One sample of everything, as plain text. Used to check the plumbing."""
     sampler = Sampler()
+    make_engine(sampler)
     # The slow loop walks every process and every transcript; on a cold start
     # that takes a good few seconds. Wait for it rather than reporting zeros.
     deadline = time.time() + 60
@@ -2706,13 +3189,30 @@ def probe() -> int:
     print(f"agents       {len(snap.get('agents') or [])} "
           f"({sum(1 for a in snap.get('agents') or [] if a['live'])} live)")
     print("alerts       " + " | ".join(a["short"] for a in compute_alerts(snap, sampler)))
+    sampler._evaluate()
+    for f in sampler.read().get("findings") or []:
+        print(f"finding      [{f.severity}{' muted' if f.muted else ''}] {f.key}: {f.title}")
+        print(f"               because {f.because}")
+        print(f"               fix     {f.fix}")
     if snap.get("errors"):
         print("errors      ", snap["errors"])
     sampler.stop.set()
     return 0
 
 
+def make_engine(sampler: Sampler) -> findings.Engine:
+    """The findings engine, fed by the sampler's slow loop (findings.py, rules/)."""
+    def play() -> None:                                    # critical findings: once each
+        notify.play("attention", float(notify.settings().get("volume") or 1.0))
+    engine = findings.Engine(beltconfig.load(), note=sampler._note, play=play)
+    sampler.engine = engine
+    return engine
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["rules"]:                         # belt.py rules --list
+        print(findings.list_rules())
+        return 0
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--probe", action="store_true",
@@ -2723,6 +3223,7 @@ def main() -> int:
     if args.probe:
         return probe()
     sampler = Sampler()
+    make_engine(sampler)
     app = Belt(sampler, mini=args.mini)
     try:
         app.run()
