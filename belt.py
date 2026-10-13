@@ -1541,12 +1541,17 @@ class DragBar(Static):
         mover = self.app.mover
         if mover.hwnd is None:
             return
+        old = getattr(self, "_timer", None)
+        if old is not None:
+            old.stop()                                      # a press while one is still followed
         self._grab = (mover.position(), mover.mouse())
         self._dragging = False
         self._timer = self.set_interval(1 / 60, self._follow)
 
     def _follow(self) -> None:
         mover = self.app.mover
+        if self._grab is None:                              # a tick already queued when released
+            return
         window, grab = self._grab
         mouse = mover.mouse()
         if mover.button_down():
