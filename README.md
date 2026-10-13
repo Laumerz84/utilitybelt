@@ -189,6 +189,14 @@ The `.wav` files are committed so a fresh clone works without running
 python -m unittest discover -s tests
 ```
 
+End-to-end checks for findings (critical sound once, broken settings file, mutes
+surviving a restart, history and its bound, a crashing rule), using a scratch
+settings folder rather than your real one:
+
+```
+python e2e/check_findings.py
+```
+
 `agentlog.py` reads agent logs incrementally (only what was appended since the last read), so following working agents stays cheap however long their logs get.
 
 ## Costs

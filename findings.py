@@ -236,6 +236,7 @@ class Engine:
             lines = beltconfig.HISTORY.read_text(encoding="utf-8").splitlines()
         except OSError:
             return []
+        self._file_lines = len(lines)
         out = []
         for ln in lines[-limit:]:
             try:
@@ -257,8 +258,10 @@ class Engine:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry) + "\n")
-            if path.stat().st_size > 2000 * limit:   # keep the file about as small as the list
+            self._file_lines = getattr(self, "_file_lines", 0) + 1
+            if self._file_lines > 2 * limit:          # the file never holds more than twice the list
                 path.write_text("".join(json.dumps(e) + "\n" for e in self.history), encoding="utf-8")
+                self._file_lines = len(self.history)
         except OSError as exc:
             self.note(f"history not saved: {exc}")
 
