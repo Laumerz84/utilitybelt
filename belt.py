@@ -1954,6 +1954,7 @@ class Belt(App):
         self._acting: dict = {}            # finding key -> until when its button says "working"
         self._mute_menu = None              # finding key whose mute choices are open
         self._show_muted = False
+        self._seen: set = set()             # (key, since) of findings shown on the open strip
 
     def ui_hidden(self) -> bool:
         """Docked and slid up out of sight: nothing on screen can be read."""
@@ -2091,6 +2092,8 @@ class Belt(App):
         steps = slide_steps(y, target_y)
         self._sliding, self._shown, self._away_since = True, shown, None
         self._sync_sampler()
+        if shown:                                           # whatever it shows now has been seen
+            self._seen |= {(f.key, f.since) for f in self.sampler.read().get("findings") or []}
         if isinstance(self.screen, Overview):
             self.screen.redraw()                            # the full strip, or the sliver's line
         if shown:
@@ -2311,7 +2314,7 @@ class Belt(App):
         hits: dict = {}
         lines: list[Text] = []
 
-        if self.ui_hidden() and live:                      # only the bottom row shows
+        if self.ui_hidden() and self.wants_attention():    # only the bottom row shows
             rows = max(1, self.screen.size.height if self.screen else 1)
             lines = [Text("")] * (rows - 1) + [self._sliver_line(snap, live, muted, width)]
             if bar is not None:
@@ -2526,10 +2529,23 @@ class Belt(App):
     def strip_peek(self) -> int:
         """How much of the hidden strip stays on screen: a sliver, or its whole
         last row (count, waiting, time) while there is something to report."""
-        found = self.sampler.read().get("findings") or []
-        if not any(not f.muted for f in found) or not getattr(self, "_cell", None):
+        if not self.wants_attention() or not getattr(self, "_cell", None):
             return PEEK
         return self._visible(1)
+
+    def wants_attention(self) -> bool:
+        """Should the hidden strip keep a row showing? For a critical finding,
+        always; for a warning, until the strip has been opened since it appeared;
+        for info, never (those can sit there for hours: a permanent row over the
+        top of every window is worse than the thing it reports)."""
+        for f in self.sampler.read().get("findings") or []:
+            if f.muted:
+                continue
+            if f.severity == "critical":
+                return True
+            if f.severity == "warn" and (f.key, f.since) not in self._seen:
+                return True
+        return False
 
     def shown_y(self) -> int:
         """Where a docked, slid-down strip sits. Its lines are drawn at the bottom

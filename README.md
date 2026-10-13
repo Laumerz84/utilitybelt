@@ -100,8 +100,10 @@ gone; nothing needs dismissing.
   forever (critical findings: 1 hour at most); muted ones are counted on the
   quiet line, click the count to see or unmute them. A **critical** finding
   turns the strip red and plays `attention.wav` once, when it appears.
-- **Hidden strip:** with findings, one row stays showing: how many, chats
-  waiting, the time. Without, it is the usual 4 px sliver.
+- **Hidden strip:** one row stays showing (how many, chats waiting, the time)
+  for a critical finding, or a warning you have not seen yet: opening the
+  strip once counts as seen. Otherwise it is the usual 4 px sliver; info
+  findings never keep a row on screen.
 - **`f`** opens Findings: each in full, then the ones that have cleared, with
   how long they lasted (kept across restarts, in
   `%APPDATA%\UtilityBelt\findings-history.jsonl`).
