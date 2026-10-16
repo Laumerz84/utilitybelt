@@ -53,7 +53,7 @@ Lines never wrap — they end in an ellipsis.
 | Storage | read/write graph, per-volume capacity, lifetime bytes and op counts per device |
 | Network | download and upload graphs, Tailscale, per-interface totals, errors, sockets |
 | Claude | which chats are working, waiting on you, or probably stuck on a permission prompt; per-model token and cost table |
-| Agents | every working subagent live: its task, type, model, which chat started it, what it is doing right now and for how long, and its last 8 steps; then the recently finished ones. Click one (or ↑/↓ and Enter) to watch it: its task, Claude's output in full, thinking (when the log kept the words), every tool call with its full input, and results, following new steps like `tail -f` while scrolled to the bottom |
+| Agents | while this screen is open: every Claude chat working right now (◆) and every working subagent (●), live: its task or chat title, type, model, which chat started it, what it is doing right now and for how long, how full its context is and how many tokens it has written, its last 14 steps and the last thing it said; then the recently finished agents. Chats are only followed while the screen (or a feed) is open, from the end of their transcript, so this costs nothing the rest of the time. Click one (or ↑/↓ and Enter) to watch it: its task, Claude's output in full, thinking (when the log kept the words), every tool call with its full input, and results, following new steps like `tail -f` while scrolled to the bottom |
 | Processes | Claude Code helpers (each loaded chat's MCP servers), leftover script processes whose parent has closed, then top processes |
 | Health (`h`) | everything flagged, the Windows event log for 7 days (hardware/WHEA errors, blue screens, GPU driver resets, unexpected restarts, app crashes), board, BIOS, CPU, RAM and driver versions |
 
@@ -94,6 +94,10 @@ gone; nothing needs dismissing.
 | `models` | no | Ollama: a model starving a game of VRAM, a model spilling into system RAM, two models that do not fit together, reload churn |
 | `remote` | no | Sunshine: a stream live right now (only its log knows; the stream is UDP), the screen left at the stream's resolution |
 
+- **Links:** with the mouse over the strip, its values are links: agents opens
+  Agents, VRAM opens GPU, spend opens Claude, the drive opens Storage (and
+  findings / health when there is room). Clicking a finding opens Findings.
+  The window goes back to full size first. Dragging by a link still moves it.
 - **On the strip:** each finding is two lines, its buttons at the right. A
   button that ends a process or deletes something asks for a second click and
   names exactly what it will touch. `mute` offers 1 hour, until restart, or

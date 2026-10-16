@@ -126,11 +126,26 @@ class AgentLog:
 
     MAX_EVENTS = 2000                     # a very long agent keeps its most recent steps
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, tail: int = 0) -> None:
+        """tail: start this many bytes from the end (a long chat transcript's
+        whole history is not needed to show what it is doing now)."""
         self.path = Path(path)
         self.offset = 0
         self.partial = b""
+        self.skip_first = False
+        if tail:
+            try:
+                size = self.path.stat().st_size
+            except OSError:
+                size = 0
+            if size > tail:
+                self.offset, self.skip_first = size - tail, True
         self.events: list[dict] = []
+        # From each Claude reply's usage: tokens written so far, and how full the
+        # context was on the latest call (input + cache read + cache written).
+        self.tokens_out = 0
+        self.context = 0
+        self.model = ""
         meta_path = self.path.with_name(self.path.stem + ".meta.json")
         try:
             self.meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -149,14 +164,27 @@ class AgentLog:
         data = self.partial + chunk
         lines = data.split(b"\n")
         self.partial = lines.pop()                  # incomplete last line waits for the rest
+        if self.skip_first and lines:
+            lines.pop(0)                            # started mid-file: the first line is cut
+            self.skip_first = False
         new = []
         for raw in lines:
             if not raw.strip():
                 continue
             try:
-                new.extend(events_from_entry(json.loads(raw.decode("utf-8", errors="replace"))))
+                entry = json.loads(raw.decode("utf-8", errors="replace"))
             except ValueError:
                 continue
+            if not isinstance(entry, dict):
+                continue
+            msg = entry.get("message") if entry.get("type") == "assistant" else None
+            usage = msg.get("usage") if isinstance(msg, dict) else None
+            if isinstance(usage, dict):
+                self.tokens_out += usage.get("output_tokens") or 0
+                self.context = ((usage.get("input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0)
+                                + (usage.get("cache_creation_input_tokens") or 0)) or self.context
+                self.model = msg.get("model") or self.model
+            new.extend(events_from_entry(entry))
         self.events.extend(new)
         del self.events[:-self.MAX_EVENTS]
         return new

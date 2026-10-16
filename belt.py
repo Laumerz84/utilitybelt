@@ -153,6 +153,9 @@ HIDDEN_FAST_EVERY = 5.0         # seconds between cheap samples while the strip 
                                 # slid out of sight: coarse history, not a gap
 HIDDEN_SLOW_EVERY = 4           # ...and only every 4th process/disk walk (~12 s)
 STRANDED_EVERY = 6 * 3600       # how often to look for caches left behind on C:
+AGENT_RECENT = 8                # steps kept per working agent (the findings rules read these)
+AGENT_RECENT_DETAILED = 14      # ...while the Agents screen is open
+CHAT_TAIL_BYTES = 1024 * 1024   # how much of a working chat's transcript the feed reads
 AGENT_LIVE_SECONDS = 90         # an agent transcript touched more recently than
                                 # this is treated as still working
 SESSION_RECENT_HOURS = 12       # chats older than this are not "waiting on you"
@@ -181,6 +184,11 @@ DDR_GRADES = ("4800", "5200", "5600", "6000", "6200", "6400", "6600", "6800",
 
 
 # --------------------------------------------------------------- formatting
+
+def tokens(n: float) -> str:
+    """Token counts the short way: 950, 12.3k, 1.2M."""
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.1f}k" if n >= 1e3 else f"{n:.0f}"
+
 
 def human_bytes(n: float) -> str:
     n = float(n or 0)
@@ -496,6 +504,10 @@ class Sampler:
         self._agent_logs: dict[Path, agentlog.AgentLog] = {}
         self._watched: set[Path] = set()          # open in the agent view: follow even when idle
         self._titles: dict[str, str] = {}         # session id -> chat title, from _sample_claude
+        # How many Agents screens / agent views are open. Only then are working
+        # chats followed too, with longer step lists: the detailed feed costs
+        # nothing while nobody is looking at it.
+        self.agents_open = 0
         threading.Thread(target=self._agent_loop, daemon=True).start()
 
     # -- fast: every second, cheap counters only
@@ -975,9 +987,11 @@ class Sampler:
         (every 3 s); reading them costs only what was appended since last time."""
         tick = 0
         candidates: list[Path] = []
+        chats: list[Path] = []
         while not self.stop.wait(1.0):
             try:
                 now = time.time()
+                detailed = self.agents_open > 0
                 if tick % 3 == 0 and PROJECTS.exists():
                     candidates = []
                     for path in PROJECTS.glob("*/*/subagents/**/agent-*.jsonl"):
@@ -986,44 +1000,66 @@ class Sampler:
                                 candidates.append(path)
                         except OSError:
                             continue
+                    chats = []
+                    if detailed:                            # working chats: only while someone looks
+                        for path in PROJECTS.glob("*/*.jsonl"):
+                            try:
+                                if now - path.stat().st_mtime < AGENT_LIVE_SECONDS:
+                                    chats.append(path)
+                            except OSError:
+                                continue
                 tick += 1
                 with self.lock:
-                    follow = set(candidates) | self._watched
+                    follow = set(candidates) | set(chats) | self._watched
                 for path in follow:
                     log = self._agent_logs.get(path)
                     if log is None:
-                        log = self._agent_logs[path] = agentlog.AgentLog(path)
+                        log = self._agent_logs[path] = new_log(path)
                     with self.lock:
                         log.poll()
-                live = []
-                for path in candidates:
-                    log = self._agent_logs[path]
-                    live.append(self._agent_summary(log, now))
-                live.sort(key=lambda a: a["started"])
+                keep = AGENT_RECENT_DETAILED if detailed else AGENT_RECENT
+                live = sorted((self._agent_summary(self._agent_logs[p], now, keep) for p in candidates),
+                              key=lambda a: a["started"])
+                working = sorted((self._agent_summary(self._agent_logs[p], now, keep) for p in chats),
+                                 key=lambda a: -a["now"]["since"])
                 with self.lock:
                     self.snap["live_agents"] = live
+                    self.snap["live_chats"] = working
+                    if not detailed:                        # screen closed: let the chat logs go
+                        for path in [p for p in self._agent_logs if not p.name.startswith("agent-")
+                                     and p not in self._watched]:
+                            del self._agent_logs[path]
                     for path in list(self._agent_logs):     # forget agents nobody is following
                         if path not in follow and len(self._agent_logs) > 40:
                             del self._agent_logs[path]
             except Exception as exc:
                 self._note(f"agents: {exc}")
 
-    def _agent_summary(self, log: agentlog.AgentLog, now: float) -> dict:
+    def _agent_summary(self, log: agentlog.AgentLog, now: float, keep: int = AGENT_RECENT) -> dict:
         evs = log.events
         meta = log.meta
+        is_chat = not log.path.name.startswith("agent-")
         session_dir = next((p for p in log.path.parents if p.name == "subagents"), log.path.parent).parent
         workflow = next((p.name for p in log.path.parents if p.name.startswith("wf_")), "")
+        if is_chat:
+            desc = self._titles.get(log.path.stem) or next(
+                (e["text"][:60] for e in reversed(evs) if e["kind"] == "task"), "") or log.path.stem[:8]
+        else:
+            desc = meta.get("description") or next((e["text"][:60] for e in evs if e["kind"] == "task"), "")
         return {
             "path": log.path,
+            "kind": "chat" if is_chat else "agent",
             "id": log.path.stem.replace("agent-", "")[:10],
-            "desc": meta.get("description") or next((e["text"][:60] for e in evs if e["kind"] == "task"), ""),
-            "type": meta.get("agentType") or "", "model": meta.get("model") or "",
-            "chat": self._titles.get(session_dir.name, ""), "workflow": workflow,
+            "desc": desc,
+            "type": "chat" if is_chat else meta.get("agentType") or "",
+            "model": meta.get("model") or log.model.removeprefix("claude-"),
+            "chat": "" if is_chat else self._titles.get(session_dir.name, ""), "workflow": workflow,
             "started": evs[0]["ts"] if evs else now,
             "tools": sum(1 for e in evs if e["kind"] == "tool"),
             "errors": sum(1 for e in evs if e["kind"] == "result" and e["error"]),
             "now": agentlog.now_step(evs),
-            "recent": [e for e in evs if e["kind"] not in ("task", "system")][-8:],
+            "recent": [e for e in evs if e["kind"] not in ("task", "system")][-keep:],
+            "tokens_out": log.tokens_out, "context": log.context,
         }
 
     def watch_agent(self, path: Path, on: bool = True) -> None:
@@ -1035,7 +1071,7 @@ class Sampler:
         """A copy of one agent's events (read so far) and its summary."""
         log = self._agent_logs.get(path)
         if log is None:
-            log = self._agent_logs[path] = agentlog.AgentLog(path)
+            log = self._agent_logs[path] = new_log(path)
         with self.lock:
             if not log.events:
                 log.poll()
@@ -1135,6 +1171,11 @@ class Sampler:
     def read(self) -> dict:
         with self.lock:
             return dict(self.snap)
+
+
+def new_log(path: Path) -> agentlog.AgentLog:
+    """A reader for a transcript. A chat's can be tens of MB: read only its end."""
+    return agentlog.AgentLog(path, tail=0 if path.name.startswith("agent-") else CHAT_TAIL_BYTES)
 
 
 def describe_cmd(cmd: str) -> str:
@@ -1606,19 +1647,30 @@ class MiniStrip(DragBar):
         off = event.get_content_offset(self)
         if off is None:
             return None
-        return next((hit for x0, x1, hit in self.hits.get(off.y, ()) if x0 <= off.x < x1), None)
+        under = [hit for x0, x1, hit in self.hits.get(off.y, ()) if x0 <= off.x < x1]
+        # a real button wins over a link (a link cut short by the line's end can sit under one)
+        return next((h for h in under if h[0] != "view"), under[0] if under else None)
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
-        if event.button == 1 and self._hit(event):
+        hit = self._hit(event) if event.button == 1 else None
+        if hit and hit[0] != "view":
             return                                          # a finding button: acts on the click
+        self._press_hit = hit                               # a link: opens on a click, not a drag
         super().on_mouse_down(event)
 
     def on_click(self, event: events.Click) -> None:
         hit = self._hit(event)
+        if hit and hit[0] != "view":
+            self.app.strip_hit(hit)
+        elif hit and self.app.mover.hwnd is None:
+            self.app.strip_hit(hit)                         # no dragging here: a link opens at once
+        elif not hit:
+            super().on_click(event)
+
+    def on_plain_click(self) -> None:
+        hit, self._press_hit = getattr(self, "_press_hit", None), None
         if hit:
             self.app.strip_hit(hit)
-        else:
-            super().on_click(event)
 
     def on_drag_end(self) -> None:
         self.app.strip_dropped()
@@ -1735,6 +1787,8 @@ class Detail(Screen):
             self.redraw()
 
     def redraw(self) -> None:
+        if not self.query("#detail-content"):              # closed again while still opening
+            return
         snap = self.app.sampler.read()
         self.query_one("#dtitle", Static).update(
             f"[bold]UtilityBelt[/] [dim]›[/] [bold]{self.TITLES.get(self.key, self.key)}[/]"
@@ -1770,6 +1824,13 @@ class AgentsScreen(Detail):
         self.selected = 0
         self.paths: list[Path] = []
 
+    def on_mount(self) -> None:
+        self.app.sampler.agents_open += 1                 # the detailed feed, only while open
+        super().on_mount()
+
+    def on_unmount(self) -> None:
+        self.app.sampler.agents_open -= 1
+
     def compose(self) -> ComposeResult:
         yield Static(id="dtitle")
         with VerticalScroll(id="detail-body"):
@@ -1782,9 +1843,10 @@ class AgentsScreen(Detail):
         app = self.app
         snap = app.sampler.read()
         live = snap.get("live_agents") or []
+        chats = snap.get("live_chats") or []
         live_paths = {a["path"] for a in live}
         done = [a for a in snap.get("agents") or [] if a["path"] not in live_paths][:10]
-        rows = [("live", a) for a in live] + [("done", a) for a in done]
+        rows = [("live", a) for a in chats] + [("live", a) for a in live] + [("done", a) for a in done]
         paths = [a["path"] for _, a in rows]
         box = self.query_one("#agent-blocks", Vertical)
         if paths != self.paths:                           # agent set changed: rebuild the blocks
@@ -1804,9 +1866,10 @@ class AgentsScreen(Detail):
         seen = (f"{len(snap.get('agents') or [])} seen in total" if snap.get("claude_ready")
                 else "scanning older agents…")
         self.query_one("#agents-head", Static).update(
-            f"[bold]{len(live)}[/] working now  [dim]· {seen} · click one, or ↑/↓ and Enter, "
-            f"to watch it live[/]"
-            + ("" if live else "\n\n[dim]No agent is working right now.[/]"))
+            f"[bold]{len(chats)}[/] chat{'s' if len(chats) != 1 else ''} and [bold]{len(live)}[/] "
+            f"agent{'s' if len(live) != 1 else ''} working now  [dim]· {seen} · click one, or ↑/↓ "
+            f"and Enter, to watch it live[/]"
+            + ("" if live or chats else "\n\n[dim]Nothing is working right now.[/]"))
         self.query_one("#agents-foot", Static).update(
             f"\n[dim]'Working' means its log was written to in the last {AGENT_LIVE_SECONDS}s. "
             f"Steps appear as each one finishes.[/]")
@@ -1849,10 +1912,12 @@ class AgentView(Detail):
 
     def on_mount(self) -> None:
         self.app.sampler.watch_agent(self.path)
+        self.app.sampler.agents_open += 1
         super().on_mount()
 
     def on_unmount(self) -> None:
         self.app.sampler.watch_agent(self.path, on=False)
+        self.app.sampler.agents_open -= 1
 
     def redraw(self) -> None:
         app = self.app
@@ -2169,12 +2234,21 @@ class Belt(App):
         where = " · ".join(x for x in (a["chat"] and f"from {escape(a['chat'][:40])}",
                                        a["workflow"] and escape(a["workflow"][:16])) if x)
         errs = f" · [red]{a['errors']} failed[/]" if a["errors"] else ""
-        lines = [f"[green]●[/] [bold]{escape(a['desc'][:width - 30] or a['id'])}[/]  "
-                 f"[dim]{escape(a['type'])} · {escape(a['model'])} · running {self._since(a['started'])} · "
+        mark = "[cyan]◆[/]" if a.get("kind") == "chat" else "[green]●[/]"
+        since = "live chat" if a.get("kind") == "chat" else f"running {self._since(a['started'])}"
+        lines = [f"{mark} [bold]{escape(a['desc'][:width - 30] or a['id'])}[/]  "
+                 f"[dim]{escape(a['type'])} · {escape(a['model'])} · {since} · "
                  f"{a['tools']} tool calls[/]{errs}",
                  f"  [dim]{where}[/]" if where else "",
                  f"  now  [{slow}]{escape(step['label'][:width - 20])}[/]  [dim]for {duration(waited)}[/]"]
+        if a.get("context") or a.get("tokens_out"):
+            lines.append(f"  [dim]context {tokens(a['context'])} · {tokens(a['tokens_out'])} written"
+                         f"{' (since the feed opened)' if a.get('kind') == 'chat' else ''}[/]")
         lines += [f"  {self._event_line(e, width - 14)}" for e in a["recent"]]
+        said = next((e for e in reversed(a["recent"]) if e["kind"] == "output"), None)
+        if said and len(a["recent"]) > AGENT_RECENT:          # the detailed feed: its latest words
+            text = " ".join(said["text"].split())
+            lines.append(f"  [dim]last said:[/] {escape(text[:2 * (width - 16)])}")
         return "\n".join(x for x in lines if x)
 
     def render_agent_done(self, a: dict) -> str:
@@ -2340,6 +2414,10 @@ class Belt(App):
             pieces.append(("[on grey23] mute [/]", 6, ("mute", f.key)))
             row = len(lines)
             lines.append(self._line_with_buttons(head, pieces, width, row, hits))
+            buttons_at = min((x0 for x0, _, _ in hits.get(row, ())), default=width)
+            hits.setdefault(row, []).append((0, max(0, buttons_at - 1), ("view", "findings")))
+            if self._mute_menu != f.key:
+                hits.setdefault(row + 1, []).append((0, width, ("view", "findings")))
             if self._mute_menu == f.key:
                 opts = [("1 hour", "1h")] + ([] if f.severity == "critical" else
                                              [("until restart", "reboot"), ("forever", "forever")])
@@ -2360,10 +2438,7 @@ class Belt(App):
         # the quiet row: demoted below the findings, the whole strip when there are none
         cited = {c for f in live for c in f.cites}
         crit = any(f.severity == "critical" for f in live)
-        left = "[green]●[/] [dim]all clear[/]" if not live else ""
-        more = len(live) - STRIP_MAX_FINDINGS
-        extra = [f"[bold]+{more} more[/] [dim](f)[/]"] if more > 0 else []
-        left = "   ".join(x for x in [left, *extra, self._quiet_items(snap, cited, crit)] if x)
+        hover = bool(bar is not None and getattr(bar, "hover", False))
         right = []
         if muted:
             label = f"{len(muted)} muted"
@@ -2373,6 +2448,30 @@ class Belt(App):
             right.append(("[yellow]⬆ update (u)[/]", 12, None))
         if "clock" in self._quiet_row():
             right.append((f"[dim]{datetime.now():%H:%M}[/]", 5, None))
+        # columns the left part may use before it reaches the right-hand items
+        room = (width - Text.from_markup(self._buttons(bar)).cell_len
+                - sum(n for _, n, _ in right) - 2 * len(right) - 2)
+        segs = []                                           # (markup, cells, view it opens)
+        if not live:
+            segs.append(("[green]●[/] [dim]all clear[/]", 11, "findings"))
+        more = len(live) - STRIP_MAX_FINDINGS
+        if more > 0:
+            segs.append((f"[bold]+{more} more[/] [dim](f)[/]", len(f"+{more} more (f)"), "findings"))
+        segs += self._quiet_items(snap, cited, crit, hover)
+        if hover:                                           # views with no number of their own,
+            for v in ("findings", "health"):                # where there is room for the whole word
+                used = sum(n for _, n, _ in segs) + 2 * len(segs)
+                if used + len(v) <= room and not any(view == v for _, _, view in segs):
+                    segs.append((f"[underline]{v}[/]", len(v), v))
+        x, parts = 0, []
+        for markup, cells, view in segs:
+            if parts:
+                x += 2
+            parts.append(markup)
+            if view and x < room:                           # a link cut short still opens, up to the cut
+                hits.setdefault(len(lines), []).append((x, min(x + cells, room), ("view", view)))
+            x += cells
+        left = "  ".join(parts)
         row = len(lines)
         btns = self._buttons(bar)
         lines.append(self._line_with_buttons(left, right, width - Text.from_markup(btns).cell_len,
@@ -2392,8 +2491,13 @@ class Belt(App):
         engine = self.sampler.engine
         return engine.cfg.quiet_row if engine else ["agents", "vram", "spend", "disk", "clock"]
 
-    def _quiet_items(self, snap: dict, cited: set, crit: bool) -> str:
-        """The quiet row's values: low contrast, except one a finding is about."""
+    QUIET_VIEWS = {"agents": "agents", "vram": "gpu", "spend": "claude", "disk": "storage", "cpu": "cpu",
+                   "gpu": "gpu", "mem": "memory", "net": "network", "gputemp": "gpu"}
+
+    def _quiet_items(self, snap: dict, cited: set, crit: bool, hover: bool = False) -> list:
+        """The quiet row's values as (markup, cells, view): low contrast, except one a
+        finding is about; underlined while the mouse is over the strip, since each
+        opens its panel."""
         s = self.sampler
         hot = "bold red" if crit else "bold yellow"
         out = []
@@ -2435,8 +2539,11 @@ class Belt(App):
             if value is None:
                 continue
             style = hot if item in cited else "grey70"
-            out.append(f"[grey50]{escape(label)}[/] [{style}]{escape(value)}[/]")
-        return "  ".join(out)
+            if hover:
+                style += " underline"
+            out.append((f"[grey50{' underline' if hover else ''}]{escape(label)}[/] [{style}]{escape(value)}[/]",
+                        Text(f"{label} {value}").cell_len, self.QUIET_VIEWS.get(item)))
+        return out
 
     def _sliver_line(self, snap: dict, live: list, muted: list, width: int) -> Text:
         """What the slid-away strip still shows: how many findings, chats
@@ -2508,11 +2615,22 @@ class Belt(App):
                 self._reevaluate()
         elif kind == "muted":
             self._show_muted = not self._show_muted
+        elif kind == "view":
+            self.open_view(key)
+            return
         elif kind == "unmute":
             engine.unmute(key)
             self._reevaluate()
         if isinstance(self.screen, Overview):
             self.screen.redraw()
+
+    def open_view(self, key: str) -> None:
+        """Open a panel from the strip: the strip is too small to show one, so
+        the window goes back to its full size first."""
+        screen = self.screen
+        if isinstance(screen, Overview) and screen.is_mini():
+            self.set_small(False)
+        self.open_detail(key)
 
     def _reevaluate(self) -> None:
         """Work the findings out again now (off the UI thread), not at the next pass."""
