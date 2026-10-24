@@ -37,6 +37,9 @@ DEFAULTS = {
     },
     "quiet_row": {"items": ["agents", "vram", "spend", "disk", "clock"]},
     "remote": {"sunshine_log": r"C:\Program Files\Sunshine\config\sunshine.log"},
+    # the Strategy Lab (screener): its service's status file, and the Search Zoo page that shows it
+    "lab": {"status": r"G:\screener-lab\service\status.json", "zoo": "http://127.0.0.1:8784",
+            "repo": r"C:\Users\andre\Python\Screener-v2"},
     "mutes": {"hygiene.stranded_cache": "forever"},
 }
 
@@ -69,6 +72,11 @@ items = ["agents", "vram", "spend", "disk", "clock"]
 [remote]
 sunshine_log = 'C:\\Program Files\\Sunshine\\config\\sunshine.log'
 
+[lab]                        # while a Strategy Lab search runs the strip shows "lab gen N"; a click opens the Search Zoo
+status = 'G:\\screener-lab\\service\\status.json'   # '' = never show it
+zoo = 'http://127.0.0.1:8784'
+repo = 'C:\\Users\\andre\\Python\\Screener-v2'      # the zoo is started from here (its .venv) when it is not running
+
 [mutes]
 # "finding.key" = "forever" | "until 2026-10-12 19:30" | "reboot 2026-10-12 08:01"
 # (written by the strip's mute buttons; a reboot mute ends when the PC restarts)
@@ -85,6 +93,7 @@ class Config:
     thresholds: dict = field(default_factory=dict)
     quiet_row: list = field(default_factory=list)
     remote: dict = field(default_factory=dict)
+    lab: dict = field(default_factory=dict)
     mutes: dict = field(default_factory=dict)
     path: Path = PATH
     error: str = ""              # why the file was not used, if it was not
@@ -140,7 +149,7 @@ def load(path: Path = PATH) -> Config:
     return Config(actions=merged["actions"], sound_on_critical=merged["sound_on_critical"],
                   history_entries=int(merged["history_entries"]), rules=merged["rules"],
                   thresholds=merged["thresholds"], quiet_row=list(merged["quiet_row"]["items"]),
-                  remote=merged["remote"], mutes=merged["mutes"], path=path, error=error, notes=notes)
+                  remote=merged["remote"], lab=merged["lab"], mutes=merged["mutes"], path=path, error=error, notes=notes)
 
 
 # ------------------------------------------------------------------- mutes

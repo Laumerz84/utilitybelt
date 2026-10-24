@@ -172,6 +172,7 @@ PRICES = {                      # $ per 1M tokens: in, out, cache_read, cache_wr
 LOCAL = ("gpt-oss", "qwen", "llama", "mistral")
 
 OLLAMA_PS = "http://127.0.0.1:11434/api/ps"
+LAB_FRESH = 15 * 60       # s: a lab status.json older than this = the service is gone
 
 # Script interpreters that are only ever meant to run under a parent. One of
 # these whose parent has gone is almost always something left behind.
@@ -479,6 +480,7 @@ class Sampler:
             "stranded": [],             # caches left on C: after their env var moved them
             "ollama_loads": (),         # ((t, model), ...) each time a model was loaded
             "sunshine": None,           # remote rules only: stream state from Sunshine's log
+            "lab": None,                # a Strategy Lab search running: its service's status.json
         }
         self.engine = None              # a findings.Engine, set by main(); None = no findings
         self._disk_hist: dict = defaultdict(lambda: deque(maxlen=400))
@@ -824,6 +826,10 @@ class Sampler:
                     self._sample_sunshine(engine.cfg.remote.get("sunshine_log") or "")
                 except Exception as exc:
                     self._note(f"sunshine: {exc}")
+            try:
+                self._sample_lab()
+            except Exception as exc:
+                self._note(f"lab: {exc}")
             tick += 1
             if self.stop.wait(5.0):
                 break
@@ -874,6 +880,20 @@ class Sampler:
         with self.lock:
             self.snap["sunshine"] = {"live": sun["live"], "since": sun["since"],
                                      "screen": screen, "screen_before": sun["screen_before"]}
+
+    # -- Strategy Lab: a search is running while its service's status.json says so
+    # and was written lately (the service rewrites it every generation)
+    def _sample_lab(self) -> None:
+        cfg = self.engine.cfg.lab if self.engine is not None else beltconfig.DEFAULTS["lab"]
+        path = Path(cfg.get("status") or "")
+        lab = None
+        if cfg.get("status") and path.is_file() and time.time() - path.stat().st_mtime < LAB_FRESH:
+            st = json.loads(path.read_text(encoding="utf-8"))
+            if st.get("state") in ("running", "paused"):
+                lab = {"state": st["state"], "generation": st.get("generation"), "run_id": st.get("run_id"),
+                       "replicate": st.get("replicate"), "replicates": st.get("replicates")}
+        with self.lock:
+            self.snap["lab"] = lab
 
     def _sample_ollama(self) -> None:
         try:
@@ -2489,10 +2509,11 @@ class Belt(App):
 
     def _quiet_row(self) -> list:
         engine = self.sampler.engine
-        return engine.cfg.quiet_row if engine else ["agents", "vram", "spend", "disk", "clock"]
+        items = engine.cfg.quiet_row if engine else ["agents", "vram", "spend", "disk", "clock"]
+        return items if "lab" in items else items + ["lab"]   # shows itself only while a lab search runs
 
     QUIET_VIEWS = {"agents": "agents", "vram": "gpu", "spend": "claude", "disk": "storage", "cpu": "cpu",
-                   "gpu": "gpu", "mem": "memory", "net": "network", "gputemp": "gpu"}
+                   "gpu": "gpu", "mem": "memory", "net": "network", "gputemp": "gpu", "lab": "lab"}
 
     def _quiet_items(self, snap: dict, cited: set, crit: bool, hover: bool = False) -> list:
         """The quiet row's values as (markup, cells, view): low contrast, except one a
@@ -2536,6 +2557,10 @@ class Belt(App):
             elif item == "gputemp":
                 t = (snap.get("gpu_sensors") or {}).get("edge")
                 value = f"{t}°C" if t is not None else None
+            elif item == "lab":
+                lab = snap.get("lab")
+                if lab:
+                    value = "paused" if lab["state"] == "paused" else f"gen {lab['generation']}"
             if value is None:
                 continue
             style = hot if item in cited else "grey70"
@@ -2594,6 +2619,9 @@ class Belt(App):
 
     def strip_hit(self, hit: tuple) -> None:
         """A click on one of the strip's finding buttons."""
+        if hit[:2] == ("view", "lab"):
+            threading.Thread(target=self.open_zoo, daemon=True).start()
+            return
         engine, kind, key = self.sampler.engine, hit[0], hit[1]
         if engine is None:
             return
@@ -2623,6 +2651,25 @@ class Belt(App):
             self._reevaluate()
         if isinstance(self.screen, Overview):
             self.screen.redraw()
+
+    def open_zoo(self) -> None:
+        """The strip's "lab" item: the Search Zoo page (the lab search as live creatures) in the
+        browser; when the zoo is not running, start it from the screener repo (it opens the page)."""
+        engine = self.sampler.engine
+        cfg = engine.cfg.lab if engine is not None else beltconfig.DEFAULTS["lab"]
+        url = cfg.get("zoo") or "http://127.0.0.1:8784"
+        try:
+            with urllib.request.urlopen(url.rstrip("/") + "/api/ping", timeout=3.0):  # a busy zoo can be slow
+                pass
+        except OSError:
+            repo = Path(cfg.get("repo") or "")
+            exe = repo / ".venv" / "Scripts" / "pythonw.exe"
+            if exe.is_file():
+                subprocess.Popen([str(exe), "-m", "lab.zoo.server", "--open"], cwd=str(repo),
+                                 creationflags=0x00000008 | 0x00000200 | 0x08000000)  # detached, own group, no window
+                return
+        import webbrowser
+        webbrowser.open(url)
 
     def open_view(self, key: str) -> None:
         """Open a panel from the strip: the strip is too small to show one, so
