@@ -67,7 +67,7 @@ approval_minutes = 5         # a chat silent on a tool call (likely a permission
 
 [quiet_row]                  # what the strip shows when nothing is wrong, in order
 items = ["agents", "vram", "spend", "disk", "clock"]
-# also available: "cpu", "gpu", "mem", "net", "gputemp"
+# also available: "cpu", "gpu", "mem", "net", "gputemp", "cputemp"
 
 [remote]
 sunshine_log = 'C:\\Program Files\\Sunshine\\config\\sunshine.log'

@@ -47,7 +47,7 @@ Lines never wrap — they end in an ellipsis.
 
 | Panel | Detail view shows |
 | --- | --- |
-| CPU | 5-minute graph, every thread, frequency, context switches and interrupts per second, uptime, top processes |
+| CPU | 5-minute graph; temperature (each sensor) with its own graph and package power, when LibreHardwareMonitor runs (see below); every thread, frequency, context switches and interrupts per second, uptime, top processes |
 | Memory | 5-minute graph, breakdown, each RAM module with its running speed against the rated speed in its part number (catches EXPO being off), top processes |
 | GPU | load and VRAM graphs; on AMD cards temperature (edge, hotspot, memory), fan, power, clocks and voltage with temperature and power graphs; what Ollama has loaded and when it unloads; per-engine split; driver version |
 | Storage | read/write graph, per-volume capacity, lifetime bytes and op counts per device |
@@ -73,6 +73,8 @@ per second that a reader thread consumes. The upside is the per-engine
 breakdown; the cost is that temperature, fan speed and power draw are not
 available from Windows. On AMD cards `gpusensors.py` reads them from the driver's own ADL library
 (`atiadlxx.dll`) every 2 seconds - no admin rights, nothing to install. NVIDIA cards: see `NVIDIA-SETUP.md`.
+
+**CPU temperature.** Windows gives ordinary programs no CPU temperature: it takes a kernel driver and admin rights. `cpusensors.py` reads it from [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (free; uses the signed PawnIO driver) through its web server, `http://127.0.0.1:8085/data.json`, every 2 s, so UtilityBelt itself still runs without admin. Turn on *Options > Remote Web Server > Run* in LibreHardwareMonitor and have it start with Windows as admin (a scheduled task "at logon, highest privileges"). Without it nothing changes: the CPU card simply shows no temperature. The CPU card, the CPU page and the strip item `cputemp` show it, and the top bar warns from 85 °C (AMD X3D chips slow down at 89 °C).
 
 Slower facts come from a fourth thread: Ollama's `/api/ps` every 5 s, the
 event log every 5 minutes (about 0.3 s, no admin needed), and RAM, board, BIOS

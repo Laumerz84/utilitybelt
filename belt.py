@@ -72,6 +72,8 @@ import beltconfig
 import findings
 import notify
 import signals
+import winprocs
+import cpusensors
 import gpusensors
 import update_check
 
@@ -427,6 +429,110 @@ EVENT_KINDS = {                 # (provider, id) -> (kind, severity)
 }
 
 
+class TranscriptTally:
+    """A transcript's running totals, read incrementally: each feed() reads only the lines added
+    since the last one. A busy chat's transcript can be 150 MB, and re-reading it whole every scan
+    froze the window for 0.5-2 s each time (2026-11-12)."""
+
+    RECENT_IDS = 4000            # a reply's id repeats on consecutive lines; older ones never come back
+
+    def __init__(self, today: str) -> None:
+        self.today = today
+        self.offset = 0
+        self.partial = b""
+        self.seen: set = set()
+        self.seen_order: deque = deque()
+        self.models: dict = defaultdict(lambda: [0, 0, 0, 0])
+        self.today_models: dict = defaultdict(lambda: [0, 0, 0, 0])
+        self.calls = self.today_calls = 0
+        self.title = self.custom_title = ""
+        self.last_tool = self.last_text = self.last_kind = ""
+
+    def feed(self, path: Path) -> bool:
+        try:
+            with path.open("rb") as fh:
+                fh.seek(self.offset)
+                chunk = fh.read()
+        except OSError:
+            return False
+        self.offset += len(chunk)
+        lines = (self.partial + chunk).split(b"\n")
+        self.partial = lines.pop()                       # an unfinished last line waits for the rest
+        for raw in lines:
+            raw = raw.strip()
+            if raw:
+                try:
+                    self._entry(json.loads(raw.decode("utf-8", errors="replace")))
+                except (ValueError, AttributeError):
+                    continue
+        return True
+
+    def _entry(self, entry: dict) -> None:
+        if entry.get("type") == "custom-title" and entry.get("customTitle"):
+            self.custom_title = str(entry["customTitle"])
+        message = entry.get("message") or {}
+        if entry.get("type") == "user" and not entry.get("isSidechain"):
+            self.last_kind = "user"
+            if not self.title:
+                content = message.get("content")
+                if isinstance(content, str):
+                    self.title = content.strip().replace("\n", " ")[:60]
+        if entry.get("type") != "assistant":
+            return
+        has_tool = False
+        for block in (message.get("content") or []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                self.last_tool = block.get("name") or ""
+                has_tool = True
+            elif block.get("type") == "text" and block.get("text"):
+                self.last_text = str(block["text"]).strip().replace("\n", " ")[:70]
+        if not entry.get("isSidechain"):
+            self.last_kind = ("end_turn" if message.get("stop_reason") == "end_turn"
+                              else "tool_use" if has_tool else "assistant")
+        usage = message.get("usage")
+        if not usage:
+            return
+        mid = message.get("id")
+        if mid:
+            if mid in self.seen:
+                return
+            self.seen.add(mid)
+            self.seen_order.append(mid)
+            if len(self.seen_order) > self.RECENT_IDS:
+                self.seen.discard(self.seen_order.popleft())
+        self.calls += 1
+        model = message.get("model") or "?"
+        vals = (usage.get("input_tokens", 0), usage.get("cache_creation_input_tokens", 0),
+                usage.get("cache_read_input_tokens", 0), usage.get("output_tokens", 0))
+        for i in range(4):
+            self.models[model][i] += vals[i]
+        if (entry.get("timestamp") or "")[:10] == self.today:
+            self.today_calls += 1
+            for i in range(4):
+                self.today_models[model][i] += vals[i]
+
+    def result(self, path: Path) -> dict | None:
+        if not self.calls:
+            return None
+        models = self.models
+        return {
+            "id": path.stem.replace("agent-", "")[:10],
+            "title": self.custom_title or self.title or self.last_text or "(no prompt text)",
+            "calls": self.calls,
+            "today_calls": self.today_calls,
+            "models": dict(models),
+            "today_models": dict(self.today_models),
+            "cache_read": sum(v[2] for v in models.values()),
+            "output": sum(v[3] for v in models.values()),
+            "cost": sum(cost_of(m, v) for m, v in models.items()),
+            "last_tool": self.last_tool,
+            "last_kind": self.last_kind,
+            "workflow": path.parent.name if path.parent.name.startswith("wf_") else "",
+        }
+
+
 class Sampler:
     """Owns every reading. The UI never calls psutil or PowerShell directly."""
 
@@ -446,6 +552,7 @@ class Sampler:
         self.vram = Series()
         self.gpu_temp = Series()                  # edge temperature, C (AMD cards via ADL)
         self.gpu_power = Series()                 # W
+        self.cpu_temp = Series()                  # C, from LibreHardwareMonitor when it runs
         self.net_up = Series()
         self.net_down = Series()
         self.disk_read = Series()
@@ -494,6 +601,7 @@ class Sampler:
         self._last_disk = psutil.disk_io_counters()
         self._last_cpu_times = psutil.cpu_stats()
         self._seen_files: dict = {}
+        self._tallies: dict = {}                 # path -> TranscriptTally, for live transcripts
         self._own = {os.getpid()} | {p.pid for p in psutil.Process().parents()}
 
         threading.Thread(target=self._fast_loop, daemon=True).start()
@@ -516,9 +624,16 @@ class Sampler:
     def _fast_loop(self) -> None:
         psutil.cpu_percent(percpu=True)          # prime; first call is garbage
         adl = gpusensors.AdlReader()             # AMD temperature/fan/power; .ok False elsewhere
+        lhm = cpusensors.LhmReader()             # CPU temperature; None unless LibreHardwareMonitor runs
         tick = 0
         while not self.stop.wait(HIDDEN_FAST_EVERY if self.hidden.is_set() else 1.0):
             tick += 1
+            if tick % 2 == 1:                    # every 2 s; a local HTTP read, retried every 30 s when absent
+                cpu_reading = lhm.read()
+                with self.lock:
+                    self.snap["cpu_sensors"] = cpu_reading
+                    if cpu_reading:
+                        self.cpu_temp.push(cpu_reading["temp"])
             if adl.ok and tick % 2 == 0:         # every 2 s; a read takes ~0.3 ms
                 reading = adl.read()
                 with self.lock:
@@ -604,7 +719,47 @@ class Sampler:
                 self._cmd_cache[key] = ""
         return self._cmd_cache[key]
 
+    def _process_rows_fast(self) -> tuple[list, set] | None:
+        """All processes from one Windows call (winprocs.py): a few ms instead of 1.5-5 s with
+        psutil's one-process-at-a-time reads. CPU % comes from each process's CPU time since the
+        last scan. None off Windows (then psutil is used)."""
+        procs = winprocs.snapshot()
+        if procs is None:
+            return None
+        now = time.time()
+        prev, then = getattr(self, "_fast_prev", ({}, now))
+        wall = max(1e-3, now - then) * max(1, psutil.cpu_count(logical=True))
+        seen, rows, alive = {}, [], set()
+        for p in procs:
+            pid = p["pid"]
+            if pid == 0:                                   # System Idle Process: idle time, not a program
+                continue
+            alive.add(pid)
+            key = (pid, round(p["created"]))
+            seen[key] = p["cpu_time"]
+            before = prev.get(key)
+            row = dict(p, cpu=max(0.0, (p["cpu_time"] - before) / wall * 100) if before is not None else 0.0)
+            if row["name"].lower() in LEFTOVER_NAMES:     # which script, not just "python.exe"
+                row["what"] = describe_cmd(self._cmdline(pid, row["created"])) or row["name"]
+            rows.append(row)
+        self._fast_prev = (seen, now)
+        return rows, alive
+
     def _sample_processes(self) -> None:
+        fast = self._process_rows_fast()
+        if fast is not None:
+            rows, alive = fast
+            for key in list(self._cmd_cache):
+                if key[0] not in alive:
+                    self._cmd_cache.pop(key, None)
+            rows.sort(key=lambda r: -r["cpu"])
+            helpers, leftovers = self._helpers(rows)
+            with self.lock:
+                self.snap["procs"] = rows
+                self.snap["helpers"] = helpers
+                self.snap["leftovers"] = leftovers
+                self.snap["servers"] = self._servers
+            return
         rows = []
         alive = set()
         for proc in psutil.process_iter(["pid", "name", "memory_info", "num_threads",
@@ -965,8 +1120,17 @@ class Sampler:
             if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
                 info = cached[2]
             else:
-                info = self._read_transcript(path, today)
+                # Read only what was added, for transcripts that keep changing (live chats).
+                tally = self._tallies.get(path)
+                if tally is None or tally.today != today or st.st_size < tally.offset:
+                    tally = TranscriptTally(today)
+                tally.feed(path)
+                info = tally.result(path)
                 self._seen_files[path] = (st.st_mtime, st.st_size, info)
+                if now - st.st_mtime < 3600:                 # live: keep its place for next time
+                    self._tallies[path] = tally
+                else:
+                    self._tallies.pop(path, None)
             if not info:
                 continue
 
@@ -1099,86 +1263,10 @@ class Sampler:
 
     @staticmethod
     def _read_transcript(path: Path, today: str) -> dict | None:
-        seen: set = set()
-        models: dict = defaultdict(lambda: [0, 0, 0, 0])
-        today_models: dict = defaultdict(lambda: [0, 0, 0, 0])
-        calls = today_calls = 0
-        title = custom_title = ""
-        last_tool = ""
-        last_text = ""
-        last_kind = ""
-        try:
-            fh = path.open(encoding="utf-8", errors="replace")
-        except OSError:
-            return None
-        with fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if entry.get("type") == "custom-title" and entry.get("customTitle"):
-                    custom_title = str(entry["customTitle"])
-                message = entry.get("message") or {}
-                if entry.get("type") == "user" and not entry.get("isSidechain"):
-                    last_kind = "user"
-                    if not title:
-                        content = message.get("content")
-                        if isinstance(content, str):
-                            title = content.strip().replace("\n", " ")[:60]
-                if entry.get("type") != "assistant":
-                    continue
-                has_tool = False
-                for block in (message.get("content") or []):
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") == "tool_use":
-                        last_tool = block.get("name") or ""
-                        has_tool = True
-                    elif block.get("type") == "text" and block.get("text"):
-                        last_text = str(block["text"]).strip().replace("\n", " ")[:70]
-                if not entry.get("isSidechain"):
-                    last_kind = ("end_turn" if message.get("stop_reason") == "end_turn"
-                                 else "tool_use" if has_tool else "assistant")
-                usage = message.get("usage")
-                if not usage:
-                    continue
-                mid = message.get("id")
-                if mid and mid in seen:
-                    continue
-                if mid:
-                    seen.add(mid)
-                calls += 1
-                model = message.get("model") or "?"
-                vals = (usage.get("input_tokens", 0),
-                        usage.get("cache_creation_input_tokens", 0),
-                        usage.get("cache_read_input_tokens", 0),
-                        usage.get("output_tokens", 0))
-                for i in range(4):
-                    models[model][i] += vals[i]
-                if (entry.get("timestamp") or "")[:10] == today:
-                    today_calls += 1
-                    for i in range(4):
-                        today_models[model][i] += vals[i]
-        if not calls:
-            return None
-        return {
-            "id": path.stem.replace("agent-", "")[:10],
-            "title": custom_title or title or last_text or "(no prompt text)",
-            "calls": calls,
-            "today_calls": today_calls,
-            "models": dict(models),
-            "today_models": dict(today_models),
-            "cache_read": sum(v[2] for v in models.values()),
-            "output": sum(v[3] for v in models.values()),
-            "cost": sum(cost_of(m, v) for m, v in models.items()),
-            "last_tool": last_tool,
-            "last_kind": last_kind,
-            "workflow": path.parent.name if path.parent.name.startswith("wf_") else "",
-        }
+        """One transcript's totals, read from the start (see TranscriptTally)."""
+        tally = TranscriptTally(today)
+        tally.feed(path)
+        return tally.result(path)
 
     def _note(self, message: str) -> None:
         with self.lock:
@@ -1332,6 +1420,15 @@ def compute_alerts(snap: dict, s: Sampler) -> list[dict]:
         add(WARN, f"{len(left)} leftover process{'es' if len(left) > 1 else ''}",
             f"{len(left)} script process(es) are still running although whatever "
             f"started them has closed. Details under h.")
+
+    cpu = snap.get("cpu_sensors")
+    if cpu:
+        lvl = cpusensors.heat_level(s.cpu_temp.recent(10))
+        if lvl != OK:
+            add(lvl, f"CPU {cpu['temp']:.0f}°C",
+                f"The processor is at {cpu['temp']:.0f} °C (about 20 s average "
+                f"{s.cpu_temp.recent(10):.0f} °C). AMD X3D chips slow themselves down at 89 °C; "
+                f"check the cooler and case airflow if this stays high.")
 
     sensors = snap.get("gpu_sensors")
     if sensors:
@@ -1578,7 +1675,7 @@ class DragBar(Static):
     def _refresh(self) -> None:
         screen = self.screen
         if isinstance(screen, Overview):
-            screen.redraw()
+            screen.redraw_bar()
 
     def on_enter(self, event: events.Enter) -> None:
         self.hover = True
@@ -1744,10 +1841,26 @@ class Overview(Screen):
         grid.styles.grid_size_columns = 4 if wide else 2
         grid.styles.grid_size_rows = 2 if wide else 4
 
+    def redraw_bar(self) -> None:
+        """Only the top bar (or the strip): what a hover changes. Redrawing all eight cards
+        for that made the buttons lag on a busy PC. Uses the last full redraw's readings."""
+        last = getattr(self, "_last", None)
+        if last is None:
+            self.redraw()
+            return
+        app, (snap, alerts) = self.app, last
+        if self.is_mini():
+            strip = self.query_one("#mini", MiniStrip)
+            strip.update(app.render_mini(snap, alerts, self.size.width - 2, bar=strip))
+            return
+        bar = self.query_one("#topbar", TopBar)
+        bar.update(app.render_topbar(alerts, self.size.width - 4, bar=bar, found=snap.get("findings")))
+
     def redraw(self) -> None:
         app = self.app
         snap = app.sampler.read()
         alerts = compute_alerts(snap, app.sampler)
+        self._last = (snap, alerts)
         if self.is_mini():
             strip = self.query_one("#mini", MiniStrip)
             strip.update(app.render_mini(snap, alerts, self.size.width - 2, bar=strip))
@@ -2513,7 +2626,7 @@ class Belt(App):
         return items if "lab" in items else items + ["lab"]   # shows itself only while a lab search runs
 
     QUIET_VIEWS = {"agents": "agents", "vram": "gpu", "spend": "claude", "disk": "storage", "cpu": "cpu",
-                   "gpu": "gpu", "mem": "memory", "net": "network", "gputemp": "gpu", "lab": "lab"}
+                   "gpu": "gpu", "mem": "memory", "net": "network", "gputemp": "gpu", "cputemp": "cpu", "lab": "lab"}
 
     def _quiet_items(self, snap: dict, cited: set, crit: bool, hover: bool = False) -> list:
         """The quiet row's values as (markup, cells, view): low contrast, except one a
@@ -2557,6 +2670,9 @@ class Belt(App):
             elif item == "gputemp":
                 t = (snap.get("gpu_sensors") or {}).get("edge")
                 value = f"{t}°C" if t is not None else None
+            elif item == "cputemp":
+                t = (snap.get("cpu_sensors") or {}).get("temp")
+                value = f"{t:.0f}°C" if t is not None else None
             elif item == "lab":
                 lab = snap.get("lab")
                 if lab:
@@ -2780,7 +2896,7 @@ class Belt(App):
         lvl = level(s.cpu.recent(10), 85, 95)
         freq = snap.get("cpu_freq") or 0
         busiest = max((c.now for c in s.cpu_cores), default=0)
-        lines = [f"[{NUM[lvl]}]{s.cpu.now:.0f}%[/]  [dim]{freq / 1000:.1f} GHz[/]"]
+        lines = [f"[{NUM[lvl]}]{s.cpu.now:.0f}%[/]{self._cpu_temp(snap)}  [dim]{freq / 1000:.1f} GHz[/]"]
         lines += chart(s.cpu.points, w, self._graph_rows(h, 2), lvl=lvl)
         lines.append(f"[dim]busiest core {busiest:.0f}% · 5 min avg {s.cpu.mean:.0f}%[/]")
         return lines, lvl
@@ -2830,6 +2946,15 @@ class Belt(App):
         else:
             lines.append("[dim]Ollama idle · no model loaded[/]")
         return lines, v_l
+
+    @staticmethod
+    def _cpu_temp(snap) -> str:
+        """' 62°C' coloured by heat, or '' when LibreHardwareMonitor isn't running."""
+        sensors = snap.get("cpu_sensors")
+        if not sensors:
+            return ""
+        t = sensors["temp"]
+        return f" [{NUM[cpusensors.heat_level(t)]}]{t:.0f}°C[/]"
 
     @staticmethod
     def _gpu_temp(snap) -> str:
@@ -2989,6 +3114,15 @@ class Belt(App):
                f"{snap['cpu_logical']} threads · 5 min avg {s.cpu.mean:.1f}% · "
                f"peak {s.cpu.peak:.1f}%[/]", ""]
         out += self._graph(s.cpu.points, width, lvl)
+        sensors = snap.get("cpu_sensors")
+        if sensors:
+            tl = cpusensors.heat_level(sensors["temp"])
+            out += ["", f"[bold]temperature[/]  [{NUM[tl]}]{sensors['temp']:.1f}°C[/]  [dim]5 min peak "
+                        f"{s.cpu_temp.peak:.0f}°C · AMD X3D chips slow down at 89°C[/]"]
+            out += self._graph(s.cpu_temp.points, width, tl, top=100.0)
+            others = "  ".join(f"{escape(k)} {v:.1f}°C" for k, v in sensors["temps"].items())
+            power = f" · package {sensors['power']:.0f} W" if sensors.get("power") is not None else ""
+            out.append(f"  [dim]{others}{power}[/]")
         out += ["", "[bold]per thread[/]"]
         for i, core in enumerate(s.cpu_cores):
             cl = level(core.now, 85, 95)
@@ -3009,8 +3143,9 @@ class Belt(App):
         for p in procs[:12]:
             out.append(f"  {p['cpu']:5.1f}%  [dim]{p['pid']:>7}[/]  {escape(p['name'][:28]):<28}"
                        f"[dim]{human_bytes(p['rss'])}[/]")
-        out += ["", "[dim]Temperature, power and voltage need LibreHardwareMonitor — "
-                "coming in the sensors step.[/]"]
+        if not sensors:
+            out += ["", "[dim]No CPU temperature: Windows only gives it to programs with a kernel driver. Run "
+                    "LibreHardwareMonitor with its web server on (port 8085) and it shows up here.[/]"]
         return "\n".join(out)
 
     def _detail_memory(self, snap, s, width) -> str:
@@ -3408,6 +3543,10 @@ def main() -> int:
     args = ap.parse_args()
     if args.probe:
         return probe()
+    try:                    # stay responsive while something heavy has every core busy
+        psutil.Process().nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS if sys.platform == "win32" else -5)
+    except (psutil.Error, OSError, AttributeError):
+        pass                # not allowed (e.g. negative nice without root): run as before
     sampler = Sampler()
     make_engine(sampler)
     app = Belt(sampler, mini=args.mini)
