@@ -205,3 +205,39 @@ def write_mutes(mutes: dict, boot: float, path: Path = PATH) -> None:
         new = "".join(lines[:start + 1] + comments) + body + "".join(lines[end:])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(new, encoding="utf-8")
+
+
+# -------------------------------------------------------------- thresholds
+
+def write_threshold(name: str, value: float, path: Path = PATH) -> None:
+    """Change one number in the [thresholds] table. Only that line's value is touched:
+    comments and every other line stay as they are. (Used by Home Base's "What you can
+    change here" box; a running UtilityBelt picks the change up by itself.)"""
+    if name not in DEFAULTS["thresholds"]:
+        raise KeyError(f"unknown threshold {name!r}")
+    value = float(value)
+    shown = str(int(value)) if value == int(value) else repr(value)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        text = TEMPLATE
+    lines = text.splitlines(keepends=True)
+    start = next((i for i, ln in enumerate(lines) if re.match(r"\s*\[thresholds\]\s*(#.*)?$", ln)), None)
+    if start is None:
+        new = text + ("" if text.endswith("\n") else "\n") + f"\n[thresholds]\n{name} = {shown}\n"
+    else:
+        end = next((i for i in range(start + 1, len(lines)) if re.match(r"\s*\[", lines[i])), len(lines))
+        for i in range(start + 1, end):
+            m = re.match(rf"(\s*{re.escape(name)}\s*=\s*)([^#\s]+)([ \t]*)(.*)$", lines[i], re.S)
+            if m:
+                # keep a trailing comment in the column it was in
+                gap = max(1, len(m.group(2)) + len(m.group(3)) - len(shown)) if m.group(4).strip() else 0
+                lines[i] = m.group(1) + shown + " " * gap + m.group(4)
+                break
+        else:
+            lines.insert(start + 1, f"{name} = {shown}\n")
+        new = "".join(lines)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(new, encoding="utf-8")
+    tmp.replace(path)
